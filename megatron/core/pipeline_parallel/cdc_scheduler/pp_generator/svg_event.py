@@ -2,7 +2,10 @@
 import json
 
 import numpy as np
-import drawsvg as draw
+try:
+    import drawsvg as draw
+except ImportError:
+    draw = None
 import colorsys
 import tempfile, os
 
@@ -182,6 +185,9 @@ def draw_experiment_and_schedule(exp_events, sched_events, output_filename, tail
 
 
 def draw_events(events, output_filename, include_w=True, include_o=True, tail=50, longest_time=None, save=True, include_info=True):
+    if draw is None:
+        print("Warning: drawsvg is not installed, skipping SVG generation.")
+        return None
     canvas_info = CanvasInfo(events, tail, center_title_height=0, enable_info=True, longest_time=longest_time)
     max_len = canvas_info.max_len
     # height = canvas_info.height

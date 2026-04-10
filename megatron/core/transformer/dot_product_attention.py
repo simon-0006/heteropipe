@@ -16,7 +16,10 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
 from megatron.core.utils import divide
 from megatron.training import get_args
-from flash_attn.flash_attn_interface import flash_attn_func
+try:
+    from flash_attn.flash_attn_interface import flash_attn_func
+except ImportError:
+    flash_attn_func = None
 
 class DotProductAttention(MegatronModule):
     """
@@ -58,6 +61,8 @@ class DotProductAttention(MegatronModule):
         
         self.use_flash_attn = False
         if self.args.use_flash_attn:
+            assert flash_attn_func is not None, \
+                "flash_attn is required when --use-flash-attn is set. Install with: pip install flash-attn"
             self.use_flash_attn = True
 
         self.layer_number = max(1, layer_number)

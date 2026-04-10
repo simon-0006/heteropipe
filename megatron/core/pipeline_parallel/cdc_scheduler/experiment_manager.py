@@ -89,7 +89,8 @@ class ExperimentManager:
         infos.append(f'iter [{self.cdc_exp_test_start_iter}]: start testing')
         for i, (latency, bandwidth) in enumerate(self.cdc_latency_bandwidth_delay_as_F_stage):
             infos.append(f'iter [{self.cdc_exp_test_start_iter + i * self.cdc_exp_test_iters}-{self.cdc_exp_test_start_iter + (i+1) * self.cdc_exp_test_iters - 1}]: latency {latency}, bandwidth {bandwidth}')
-        infos.append(f'iter [{self.exp_logging_end_iter}]: end testing')
+        if hasattr(self, 'exp_logging_end_iter'):
+            infos.append(f'iter [{self.exp_logging_end_iter}]: end testing')
         return '\n'.join(infos)
     
     def read_profile_result(self):

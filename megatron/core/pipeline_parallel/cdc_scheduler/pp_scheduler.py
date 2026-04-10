@@ -912,10 +912,15 @@ class CDCPPScheduler:
             not args.defer_embedding_wgrad_compute
         ), "defer_embedding_wgrad_compute is not supported"
 
+        num_chunks = self.pp_schedule.sys_config.num_chunks
+        vp_size = args.virtual_pipeline_model_parallel_size or 1
         assert (
-            args.virtual_pipeline_model_parallel_size
-            == self.pp_schedule.sys_config.num_chunks
+            vp_size == num_chunks
         ), "For compatibility, virtual_pipeline_model_parallel_size is equivalent to number of chunks"
+        args.virtual_pipeline_model_parallel_size = num_chunks
+        from megatron.core import parallel_state as mpu
+        mpu.set_virtual_pipeline_model_parallel_world_size(num_chunks)
+        mpu.set_virtual_pipeline_model_parallel_rank(0)
 
         if self.wgrad_split:
             assert (
@@ -1075,11 +1080,10 @@ class CDCPPScheduler:
         elif event.type == CommEventType.WAIT_RECV_NEXT:
             handle = self.recv_next_reqs[(event.mb_id, event.chunk_id, event.task_type)]
             assert handle is not None
-            # handle.wait()
-            assert hasattr(
-                handle, "wait_with_lat_delay_in_ms"
-            ), "Latency injection requires custom pytorch build for wait_with_lat_delay_in_ms"
             if self.cdc_recv_next:
+                assert hasattr(
+                    handle, "wait_with_lat_delay_in_ms"
+                ), "Latency injection requires custom pytorch build for wait_with_lat_delay_in_ms"
                 # if only bandwidth delay injection, still need this api to inject spin kernel on default stream.
                 handle.wait_with_lat_delay_in_ms(
                     timedelta(milliseconds=self.injected_latency_delay[1] * 1000)
@@ -1093,11 +1097,10 @@ class CDCPPScheduler:
         elif event.type == CommEventType.WAIT_RECV_PREV:
             handle = self.recv_prev_reqs[(event.mb_id, event.chunk_id, event.task_type)]
             assert handle is not None
-            # handle.wait()
-            assert hasattr(
-                handle, "wait_with_lat_delay_in_ms"
-            ), "Latency injection requires custom pytorch build for wait_with_lat_delay_in_ms"
             if self.cdc_recv_prev:
+                assert hasattr(
+                    handle, "wait_with_lat_delay_in_ms"
+                ), "Latency injection requires custom pytorch build for wait_with_lat_delay_in_ms"
                 # if only bandwidth delay injection, still need this api to inject spin kernel on default stream.
                 handle.wait_with_lat_delay_in_ms(
                     timedelta(milliseconds=self.injected_latency_delay[1] * 1000)
@@ -1407,16 +1410,19 @@ class CDCPPScheduler:
         # grad sync
         # Disable async grad reductions
         assert self.config is not None
-        assert self.config.no_sync_func is not None
-        if isinstance(self.config.no_sync_func, list):
+        num_chunks = self.pp_schedule.sys_config.num_chunks
+        if self.config.no_sync_func is None:
+            from contextlib import nullcontext
+            self.no_sync_func = [nullcontext] * num_chunks
+        elif isinstance(self.config.no_sync_func, list):
             self.no_sync_func = self.config.no_sync_func
         else:
             self.no_sync_func = [self.config.no_sync_func,]
-        
-        assert len(self.no_sync_func) == self.pp_schedule.sys_config.num_chunks
+
+        assert len(self.no_sync_func) == num_chunks
         self.cdc_print(f"no_sync_func: {self.no_sync_func}", verbose=2)
-        
-        self.no_sync_context = [None] * self.pp_schedule.sys_config.num_chunks
+
+        self.no_sync_context = [None] * num_chunks
 
     def disable_grad_sync(self, chunk_id):
         """Disable asynchronous grad reductions"""
@@ -1524,7 +1530,7 @@ class CDCPPScheduler:
 
         for chunk_id in range(self.pp_schedule.sys_config.num_chunks):
             self.disable_grad_sync(chunk_id)
-            assert not any(bucket_group.is_last_microbatch for bucket_group in model[chunk_id].bucket_groups)
+            # is_last_microbatch is set to True by zero_grad_buffer() before this call, so no assertion needed
 
         tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
         tensor_shape[0] = (

@@ -1,12 +1,18 @@
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
-import docplex.cp.model as cp_model_cplex
-from docplex.cp.config import context as cp_context
+try:
+    import docplex.cp.model as cp_model_cplex
+    from docplex.cp.config import context as cp_context
+except ImportError:
+    cp_model_cplex = None
+    cp_context = None
 from .pipeline_config import PipelineBlockDesc, SystemConfig
 
 
 class ZBUDCPLEXScheduler:
     def __init__(self, sys_cfg: SystemConfig, warm_start=False) -> None:
+        if cp_model_cplex is None:
+            raise ImportError("docplex is required for CPLEX schedulers. Install with: pip install docplex")
         self.sys_cfg = sys_cfg
         self.num_dev = sys_cfg.num_devices
         assert sys_cfg.num_chunks == 1
@@ -402,6 +408,8 @@ class ZBUDCPLEXScheduler:
 
 class ZBWaveCPLEXScheduler:
     def __init__(self, sys_cfg: SystemConfig, warm_start=False) -> None:
+        if cp_model_cplex is None:
+            raise ImportError("docplex is required for CPLEX schedulers. Install with: pip install docplex")
         self.sys_cfg = sys_cfg
         self.num_dev = sys_cfg.num_devices
         assert sys_cfg.num_chunks == 2
@@ -854,6 +862,8 @@ class ZBWaveCPLEXScheduler:
 
 class ZBLoopCPLEXScheduler:
     def __init__(self, sys_cfg: SystemConfig, warm_start=False) -> None:
+        if cp_model_cplex is None:
+            raise ImportError("docplex is required for CPLEX schedulers. Install with: pip install docplex")
         self.sys_cfg = sys_cfg
         self.num_dev = sys_cfg.num_devices
         assert self.num_dev > 2, "currently only support more than 2 devices"
