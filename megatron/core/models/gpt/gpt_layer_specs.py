@@ -111,12 +111,15 @@ def get_gpt_layer_local_spec(
     mlp = _get_mlp_module_spec(
         use_te=False, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
+    # Capture module-level LNImpl first (Python scoping: any subsequent
+    # assignment would make LNImpl local and shadow the module-level one).
+    _LNImpl = LNImpl
     if normalization == "RMSNorm":
-        LNImpl = CompiledRMSNorm
+        _LNImpl = CompiledRMSNorm
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=LNImpl,
+            input_layernorm=_LNImpl,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
@@ -124,12 +127,12 @@ def get_gpt_layer_local_spec(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
                     linear_proj=RowParallelLinear,
-                    q_layernorm=LNImpl if qk_layernorm else IdentityOp,
-                    k_layernorm=LNImpl if qk_layernorm else IdentityOp,
+                    q_layernorm=_LNImpl if qk_layernorm else IdentityOp,
+                    k_layernorm=_LNImpl if qk_layernorm else IdentityOp,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=LNImpl,
+            pre_mlp_layernorm=_LNImpl,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
             sharded_state_dict_keys_map={

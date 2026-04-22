@@ -1,5 +1,10 @@
-import sys, types
-sys.path.insert(0, "crosspipe-main")
+import os, sys, types
+# Add the heteropipe repo root (parent of `megatron/`) and this script's dir
+# (for the local `auto_schedule` import) so imports work regardless of cwd.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_THIS_DIR)
+sys.path.insert(0, _REPO_ROOT)
+sys.path.insert(0, _THIS_DIR)
 
 # Stub missing optional deps before any import triggers them
 for mod_name in [
@@ -119,23 +124,33 @@ class PipelineConfig:
         print(f"Fixed durations (equal f): T_F={dur['T_F']}, T_B={dur['T_B']}, T_W={dur['T_W']}")
 
 
-# ========================== Shared config ==========================
+# ========================== Shared config (2-GPU benchmark, profiled) =====
+# Source: tb_logs/total.json, f_profile = --micro-batch-size = 2.
+# Per-sample cost in microseconds = (T_x[dev] / f_profile) * 1e6.
+# Microsecond scale keeps values integer-friendly for the MILP.
 CFG = PipelineConfig(
     N=32,
-    npp=4,
-    nbm=4,
-    comp=[[3, 3, 2] for _ in range(4)],
-    compBias=1,
-    comm=[0, 0],
-    commLat=[[1 if abs(i - j) == 1 else 0 for j in range(4)] for i in range(4)],
+    npp=2,
+    nbm=16,
+    comp=[
+        [3661, 4057,  12],   # dev 0: F, B, W  (T_W ~0: grad_accum_fusion absorbs dW into B)
+        [3569, 2206,  94],   # dev 1
+    ],
+    compBias=0,              # baseline: pure-linear MILP ceiling (no fixed overhead)
+    comm=[0, 0],             # matches CrossPipe's MILP (ignores T_bw)
+    commLat=[
+        [ 0, 95],            # 95 us on-node NVLink (from T_alpha)
+        [95,  0],
+    ],
     M_F=1, M_B=-1, M_W=0,
     M_Limit=-1,
 )
-# ===================================================================
+# ===========================================================================
 
 
-def solve_dynamic(with_plotting=True):
-    """Solve with dynamic microbatch sizes."""
+def solve_dynamic(with_plotting=True, time_limit=600, relative_gap=0.001,
+                  out_name="schedule_dynamic.png"):
+    """Solve with dynamic microbatch sizes (MILP picks the sizes)."""
     CFG.print_summary()
 
     g = UnidirectionalDynamicBatchSizeZBDependencyGraph(
@@ -147,31 +162,67 @@ def solve_dynamic(with_plotting=True):
         commLat=CFG.commLat,
     )
     g.build_ilp()
-    g.solve_ilp(verbose=False, time_limit=60, relative_gap=0)
+    g.solve_ilp(verbose=True, time_limit=time_limit, relative_gap=relative_gap)
 
     mb_sizes = g.get_microbatch_sizes()
     schedule = g.get_schedule()
     if schedule and with_plotting:
         print(f"Microbatch sizes: {mb_sizes} (sum={sum(mb_sizes)})")
-        plot_dynamic_schedule(schedule, g)
-    
+        plot_dynamic_schedule(schedule, g, out_name=out_name)
+
     return schedule, g.get_objective_value()
 
 
-def solve_crosspipe(with_plotting=True):
+def solve_crosspipe(with_plotting=True, time_limit=600, relative_gap=0.001,
+                    out_name="schedule.png"):
     """Solve with crosspipe fixed durations (equal microbatch sizes)."""
     cfg = CFG.to_crosspipe_system_cfg()
     g = UnidirectionalZBDependencyGraph(cfg)
     g.build_ilp()
-    g.solve_ilp(verbose=False, time_limit=60, relative_gap=0)
+    g.solve_ilp(verbose=False, time_limit=time_limit, relative_gap=relative_gap)
     schedule = g.get_schedule()
     if schedule and with_plotting:
-        plot_schedule(schedule, cfg)
+        plot_schedule(schedule, cfg, out_name=out_name)
 
     return schedule, g.get_objective_value()
 
 
-def plot_dynamic_schedule(schedule, graph):
+def solve_dynamic_fixed(fixed_sizes, with_plotting=True, time_limit=600,
+                        relative_gap=0.001, out_name="schedule_dynamic_fixed.png"):
+    """Solve dynamic-MB MILP with microbatch sizes locked to `fixed_sizes`.
+    Only the task ordering is optimised. Useful for evaluating a specific
+    size assignment (e.g. the one actually used in the 2-GPU benchmark) under
+    the MILP's own cost model."""
+    assert len(fixed_sizes) == CFG.nbm, (
+        f"expected {CFG.nbm} sizes, got {len(fixed_sizes)}"
+    )
+    assert sum(fixed_sizes) == CFG.N, (
+        f"sizes must sum to N={CFG.N}, got {sum(fixed_sizes)}"
+    )
+
+    g = UnidirectionalDynamicBatchSizeZBDependencyGraph(
+        system_cfg=CFG.to_system_cfg(),
+        N=CFG.N,
+        comp=CFG.comp,
+        compBias=CFG.compBias,
+        comm=CFG.comm,
+        commLat=CFG.commLat,
+    )
+    g.build_ilp()
+    # Lock each f_vars[i] to the given size.
+    for i, f_val in enumerate(fixed_sizes):
+        g.prob += g.prob_f[i] == f_val
+    g.solve_ilp(verbose=False, time_limit=time_limit, relative_gap=relative_gap)
+
+    schedule = g.get_schedule()
+    if schedule and with_plotting:
+        print(f"Microbatch sizes (locked): {fixed_sizes} (sum={sum(fixed_sizes)})")
+        plot_dynamic_schedule(schedule, g, out_name=out_name)
+
+    return schedule, g.get_objective_value()
+
+
+def plot_dynamic_schedule(schedule, graph, out_name="schedule_dynamic.png"):
     """Gantt chart for dynamic-batch-size schedules where block widths vary per microbatch."""
     colors = {"F": "#7239DC", "B": "#CD5C5C", "W": "#A0DAB8"}
     num_dev = len(schedule)
@@ -205,10 +256,10 @@ def plot_dynamic_schedule(schedule, graph):
     ax.legend(handles=legend_patches, loc="upper right", fontsize=8)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR, "schedule_dynamic.png"), dpi=150)
+    plt.savefig(os.path.join(OUT_DIR, out_name), dpi=150)
 
 
-def plot_schedule(schedule, cfg):
+def plot_schedule(schedule, cfg, out_name="schedule.png"):
     """Gantt-chart style visualization of a pipeline schedule.
     schedule: List[List[PipelineBlockDesc]] — one list per device, sorted by end_time.
     """
@@ -246,7 +297,7 @@ def plot_schedule(schedule, cfg):
     ax.legend(handles=legend_patches, loc="upper right", fontsize=8)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR, "schedule.png"), dpi=150)
+    plt.savefig(os.path.join(OUT_DIR, out_name), dpi=150)
 
 def plot_improvement_over_different_microbatches(list_mb):
     list_mb = sorted(list_mb)
@@ -272,16 +323,81 @@ def plot_improvement_over_different_microbatches(list_mb):
 
 
 
+def run_baseline():
+    """Single-point comparison at CFG's default parameters.
+
+    Prints makespans for three scenarios:
+      [1] CrossPipe (equal mb sizes, ZBH1-style baseline)
+      [2] Dynamic optimal — MILP jointly picks sizes and ordering
+      [3] Dynamic fixed — MILP orders, with sizes locked to the set actually
+          used in the 2-GPU benchmark run
+
+    [3] vs [1] tells you the MILP's predicted speedup for the sizes you
+    actually ran. [2] vs [3] tells you how much better the MILP thinks it
+    could have done if given more solver time / a different gap target.
+    """
+    CFG.print_summary()
+    print()
+
+    actual_sizes = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 10, 5, 2, 1]
+
+    print("=" * 72)
+    print("[1/3] CrossPipe (equal mb sizes)")
+    print("=" * 72)
+    _, t_cp = solve_crosspipe(with_plotting=True, out_name="baseline_crosspipe.png")
+
+    print()
+    print("=" * 72)
+    print("[2/3] Dynamic (MILP picks sizes)")
+    print("=" * 72)
+    _, t_dyn = solve_dynamic(with_plotting=True, out_name="baseline_dynamic_optimal.png")
+
+    print()
+    print("=" * 72)
+    print(f"[3/3] Dynamic with sizes locked to {actual_sizes}")
+    print("=" * 72)
+    _, t_actual = solve_dynamic_fixed(
+        actual_sizes,
+        with_plotting=True,
+        out_name="baseline_dynamic_benchmark_sizes.png",
+    )
+
+    def pct(a, b):
+        return (b - a) / b * 100 if b else 0.0
+
+    print()
+    print("=" * 72)
+    print("SUMMARY (makespan in microseconds; MILP objective value)")
+    print("=" * 72)
+    print(f"  [1] CrossPipe  (equal sizes):         {t_cp:12.2f}")
+    print(f"  [2] Dynamic    (optimal sizes):       {t_dyn:12.2f}   "
+          f"speedup vs [1] = {pct(t_dyn, t_cp):+.2f}%")
+    print(f"  [3] Dynamic    (benchmark sizes):     {t_actual:12.2f}   "
+          f"speedup vs [1] = {pct(t_actual, t_cp):+.2f}%")
+    print()
+    print(f"  Gap between optimal [2] and benchmark sizes [3]: "
+          f"{pct(t_dyn, t_actual):+.2f}% (how much [2] beats [3])")
+    print()
+    print("Interpretation:")
+    print("  - [3] vs [1] is the theoretical speedup the MILP expected for the")
+    print("    sizes actually used. The measured benchmark was -23%, so the gap")
+    print("    between expected and measured is the cost-model error.")
+    print("  - [2] vs [3] tells you if the chosen sizes were near-optimal under")
+    print("    the MILP's own assumptions (small gap = solver was fine, sizes")
+    print("    were good for the model).")
+
+
 if __name__ == "__main__":
-    # solve_dynamic()
-    # solve_crosspipe()
-    make_improvement = True 
-    if make_improvement:
+    mode = "baseline"  # "baseline" | "sweep_nbm"
+
+    if mode == "baseline":
+        run_baseline()
+    elif mode == "sweep_nbm":
         nmb = 2
         list_mb = []
         while nmb < CFG.N:
             list_mb.append(nmb)
             nmb *= 2
-    
         plot_improvement_over_different_microbatches(list_mb)
+
     plt.show()

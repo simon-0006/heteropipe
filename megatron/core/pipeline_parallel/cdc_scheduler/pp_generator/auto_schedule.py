@@ -26,9 +26,6 @@ except ImportError:
     sp = None
 
 gurobi_options = {
-    "WLSACCESSID": "<your_access_id>",
-    "WLSSECRET": "<your_secret>",
-    "LICENSEID": "<your_license_id>",
     "THREADS": psutil.cpu_count(logical=False),
 }
 
@@ -47,9 +44,9 @@ class DependencyGraph:
         self.prob_F: Optional[Dict[int, LpVariable]] = None
 
         for chunk in range(self.num_chunk):
-            assert all([type(Tf) is int for Tf in self.system_cfg.T_F[chunk]])
-            assert all([type(Tb) is int for Tb in self.system_cfg.T_B[chunk]])
-            assert all([type(Tw) is int for Tw in self.system_cfg.T_W[chunk]])
+            assert all([isinstance(Tf, (int, np.integer)) for Tf in self.system_cfg.T_F[chunk]])
+            assert all([isinstance(Tb, (int, np.integer)) for Tb in self.system_cfg.T_B[chunk]])
+            assert all([isinstance(Tw, (int, np.integer)) for Tw in self.system_cfg.T_W[chunk]])
             assert all(
                 [
                     f + b + w == 0
@@ -117,6 +114,7 @@ class DependencyGraph:
         raise NotImplementedError
 
     def solve_ilp(self, verbose=True, warm_start=False, time_limit=200, relative_gap=0.01) -> None:
+        solver = None
         try:
             with gp.Env(params=gurobi_options) as env:
                 solver = pulp.GUROBI(
@@ -124,13 +122,22 @@ class DependencyGraph:
                     msg=verbose,
                     warmStart=warm_start,
                     gapRel=relative_gap,
+                    MIPGapAbs=1e-6,
                     timeLimit=time_limit,
                     env=env,
                 )
                 status = self.prob.solve(solver)
                 print(f"Status: {LpStatus[status]}")
         except Exception as e:
-            print(e)
+            print(f"Gurobi failed ({e}), falling back to CBC")
+            solver = None
+            cbc = pulp.PULP_CBC_CMD(
+                msg=verbose,
+                timeLimit=time_limit,
+                gapRel=relative_gap,
+            )
+            status = self.prob.solve(cbc)
+            print(f"Status: {LpStatus[status]}")
         finally:
             if solver is not None:
                 solver.close()
@@ -362,6 +369,174 @@ class UnidirectionalZBDependencyGraph(DependencyGraph):
         except Exception as e:
             return None
 
+        return schedule
+
+
+class UnidirectionalDynamicBatchSizeZBDependencyGraph(UnidirectionalZBDependencyGraph):
+    """ZB dependency graph where microbatch sizes are decision variables.
+
+    Task durations: comp[dev][type] * f[mb] + compBias
+    Comm durations: comm[dir]      * f[mb] + commLat[src][dst]
+
+    The solver jointly optimises the schedule ordering AND the microbatch
+    sizes f[0..num_mb-1] such that sum(f) == N.
+    """
+
+    def __init__(
+        self,
+        system_cfg: SystemConfig,
+        N: int,
+        comp,       # comp[dev][type]: per-sample compute cost
+        compBias,   # fixed overhead per operation
+        comm,       # comm[dir]: per-sample comm cost (0=fwd, 1=bwd)
+        commLat,    # commLat[dev][dev']: fixed latency between devices
+    ):
+        # system_cfg is passed with dummy T_F/T_B/T_W to satisfy base assertions;
+        # actual durations come from comp/compBias/f[mb].
+        self.N = N
+        self.comp = comp
+        self.compBias = compBias
+        self.comm = comm
+        self.commLat = commLat
+        self.prob_f = None  # will hold solved microbatch size variables
+
+        super().__init__(system_cfg)
+
+    # --- LP expressions that depend on the microbatch size variables ---
+
+    def _task_time_expr(self, node_id, f_vars):
+        """Return LP expression for duration of node: comp[dev][type] * f[mb] + compBias."""
+        dev = self._get_dev(node_id)
+        tt = self._get_task_type(node_id)
+        mb = self._get_mb(node_id)
+        return self.comp[dev][tt] * f_vars[mb] + self.compBias
+
+    def _comm_cost_expr(self, prev_id, cur_id, f_vars):
+        """Return LP expression for comm cost on a cross-device dependency edge.
+        Returns 0 for same-device edges."""
+        src = self._get_dev(prev_id)
+        dst = self._get_dev(cur_id)
+        if src == dst:
+            return 0
+
+        cur_type = self._get_task_type(cur_id)
+        mb = self._get_mb(cur_id)
+
+        # Determine direction: F receives from previous device (fwd), B from next device (bwd)
+        if cur_type == 0 and dst == src + 1:
+            d = 0  # forward
+        elif cur_type == 1 and dst == src - 1:
+            d = 1  # backward
+        else:
+            # fallback: use latency only
+            return self.commLat[src][dst]
+
+        return self.comm[d] * f_vars[mb] + self.commLat[src][dst]
+
+    def build_ilp(self) -> None:
+        prob = LpProblem("DynamicBatchSchedule", LpMinimize)
+
+        # --- Microbatch size variables ---
+        f_vars = [
+            LpVariable(f"f_{mb}", lowBound=1, upBound=self.N, cat="Integer")
+            for mb in range(self.num_mb)
+        ]
+        prob += lpSum(f_vars) == self.N
+
+        # --- Ordering variables P[(i,j)] for schedulable pairs ---
+        P: Dict[Tuple, LpVariable] = {}
+        for i in range(self.nnodes):
+            for j in range(i):
+                if self._schedulable_on_dev(i, j):
+                    P[(i, j)] = LpVariable(f"P_{i}_{j}", 0, 1, cat="Binary")
+                    P[(j, i)] = 1 - P[(i, j)]
+
+        # --- Completion time variables ---
+        F: Dict[int, LpVariable] = LpVariable.dicts(
+            "F", (range(self.nnodes),), None, None, cat="Continuous"
+        )
+
+        # Big-M: upper bound on the span of a single device.
+        max_comp = max(max(row) for row in self.comp)
+        max_comm = max(self.comm) if any(c > 0 for c in self.comm) else 0
+        max_lat = max(max(row) for row in self.commLat)
+        bigM = (
+            3 * self.num_mb * (max_comp * self.N + self.compBias)
+            + self.num_mb * (max_comm * self.N + max_lat)
+        )
+
+        # Anchor first task
+        first_task = self._get_id(0, 0, 0)
+        prob += F[first_task] >= self._task_time_expr(first_task, f_vars)
+
+        # --- Dependency & ordering constraints ---
+        for i in range(self.nnodes):
+            mem_cost = []
+            for prev in range(self.nnodes):
+                if i == prev:
+                    continue
+
+                if prev in self.inherent_direct_dep[i]:
+                    # Direct dependency (same or cross device)
+                    prob += (
+                        F[i] >= F[prev]
+                        + self._task_time_expr(i, f_vars)
+                        + self._comm_cost_expr(prev, i, f_vars)
+                    )
+
+                if self._get_dev(i) == self._get_dev(prev):
+                    if self.inherent_dep[i, prev]:
+                        pass
+                    elif self.inherent_dep[prev, i]:
+                        mem_cost.append(self._get_mem_cost(prev))
+                    else:
+                        # Schedulable: big-M disjunction (linear — no f*P product)
+                        prob += (
+                            F[i] >= F[prev]
+                            + self._task_time_expr(i, f_vars)
+                            - bigM * P[(i, prev)]
+                        )
+                        mem_cost.append(self._get_mem_cost(prev) * P[(prev, i)])
+
+            mem_i = lpSum(mem_cost) + self._get_mem_cost(i)
+            if self.system_cfg.M_Limit[self._get_dev(i)] > 0:
+                prob += mem_i <= self.system_cfg.M_Limit[self._get_dev(i)]
+
+        # --- Makespan objective ---
+        res = LpVariable("res")
+        for dev in range(self.num_dev):
+            last_w = self._get_id(dev, self.num_mb - 1, 2)
+            first_f = self._get_id(dev, 0, 0)
+            prob += (
+                res >= F[last_w]
+                - F[first_f]
+                + self._task_time_expr(first_f, f_vars)
+            )
+
+        # Tiebreaker: prefer early W completion
+        eps = 1e-4
+        w_penalty = lpSum(
+            F[self._get_id(dev, mb, 2)]
+            for dev in range(self.num_dev)
+            for mb in range(self.num_mb)
+        )
+        prob.setObjective(res + eps * w_penalty)
+
+        self.prob = prob
+        self.prob_F = F
+        self.prob_f = f_vars
+
+    def get_microbatch_sizes(self) -> List[int]:
+        """Return solved microbatch sizes."""
+        if self.prob_f is None:
+            return None
+        return [int(value(fv)) for fv in self.prob_f]
+
+    def get_schedule(self) -> List[List[PipelineBlockDesc]]:
+        schedule = super().get_schedule()
+        if schedule is None:
+            return None
+        self._solved_mb_sizes = self.get_microbatch_sizes()
         return schedule
 
 

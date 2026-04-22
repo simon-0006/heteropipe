@@ -186,6 +186,7 @@ def forward_step(
     is_first_microbatch=False,
     current_microbatch=None,
     encoder_decoder_xattn=False,
+    loss_scale=None,
 ):
     """Forward step for passed-in model.
 
@@ -285,16 +286,20 @@ def forward_step(
     if parallel_state.is_pipeline_last_stage():
         if not collect_non_loss_data:
             outputs = loss_func(output_tensor)
+            # When loss_scale is provided (dynamic microbatch sizes), use it
+            # instead of 1/num_microbatches.  loss_scale = f_i / N so that
+            # the gradient is correctly weighted by each microbatch's share.
+            mb_weight = loss_scale if loss_scale is not None else (1.0 / num_microbatches)
             if len(outputs) == 3:
                 output_tensor, num_tokens, loss_reduced = outputs
                 if not config.calculate_per_token_loss:
                     output_tensor /= num_tokens
-                    output_tensor /= num_microbatches
+                    output_tensor *= mb_weight
             else:
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)
                 assert len(outputs) == 2
                 output_tensor, loss_reduced = outputs
-                output_tensor /= num_microbatches
+                output_tensor *= mb_weight
             forward_data_store.append(loss_reduced)
         else:
             data = loss_func(output_tensor, non_loss_data=True)
@@ -308,13 +313,14 @@ def forward_step(
     # explicitly.
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
-        loss_scale = (
+        moe_loss_scale = (
             config.grad_scale_func(torch.ones(1, device=output_tensor.device))
             if config.grad_scale_func is not None
             else torch.tensor(1.0)
         )
+        moe_mb_weight = loss_scale if loss_scale is not None else (1.0 / num_microbatches)
         # Set the loss scale
-        MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+        MoEAuxLossAutoScaler.set_loss_scale(moe_loss_scale * moe_mb_weight)
 
     # If T5 model and in decoder stack, then send encoder_hidden_state
     # downstream as well.

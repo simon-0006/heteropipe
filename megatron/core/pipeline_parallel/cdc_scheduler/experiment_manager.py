@@ -77,9 +77,9 @@ class ExperimentManager:
                 self.cdc_exp_test_start_iter + len(self.cdc_latency_bandwidth_delay_as_F_stage) * self.cdc_exp_test_iters
             )
             args.exit_interval = self.exp_logging_end_iter
-        else:
-            args.exit_interval = self.cdc_exp_test_start_iter
-            
+        # else: no latency/bandwidth experiments configured — train to completion.
+        # Do NOT auto-set exit_interval here; the user controls it via --exit-interval.
+
         self.profile_result = None
     
     def print_expertiment_info(self) -> str:

@@ -1506,7 +1506,9 @@ def _add_distributed_args(parser):
     group.add_argument('--enable_cdcpp_scheduler', action='store_true', default=False,)
     group.add_argument('--static_schedule', type=str, default=None, choices=['1F1B', 'GPipe','Interleaved1F1B','ZBH1','ZBV',])
     group.add_argument('--enable_prefetch_opt', action='store_true', default=False, help='prefetch optimization for static schedule. Dynamic schedule has this opt by default')
-    group.add_argument('--dynamic_schedule', type=str, default=None, choices=['wave', 'ud', 'subud'])
+    group.add_argument('--dynamic_schedule', type=str, default=None, choices=['wave', 'ud', 'subud', 'dynamic_mb'])
+    group.add_argument('--cdc_debug_mb_sizes', type=int, nargs='+', default=None,
+                       help='Skip MILP solver and use these microbatch sizes directly (e.g. --cdc_debug_mb_sizes 1 1 1 5 12 7 4 1)')
     group.add_argument('--dynamic_extra_mem_factor', type=float, default=0.0, help='Need profiling. Limit the memory to (1 + factor) * pp_size * chunks * M_F')
     group.add_argument('--zero1_dp_modeling', action='store_true', default=False, help='Model the effect of DP comms in dynamic schedule')
     

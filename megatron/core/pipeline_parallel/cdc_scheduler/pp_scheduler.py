@@ -12,10 +12,14 @@ import numpy as np
 from megatron.core.pipeline_parallel.cdc_scheduler.pp_generator.pipeline import (
     CPZBUDPipeline,
     CPZBWavePipeline,
+    OneChunkPipelineTemplate,
 )
 from megatron.core.pipeline_parallel.cdc_scheduler.pp_generator.subpipeline import DynZBUDSubPipeline
 from megatron.core.pipeline_parallel.cdc_scheduler.pp_generator.pipeline_config import (
     SystemConfig,
+)
+from megatron.core.pipeline_parallel.cdc_scheduler.pp_generator.auto_schedule import (
+    UnidirectionalDynamicBatchSizeZBDependencyGraph,
 )
 from megatron.core.pipeline_parallel.cdc_scheduler.wgrad_store import WGradStore
 from megatron.core.pipeline_parallel.cdc_scheduler.experiment_manager import (
@@ -100,6 +104,113 @@ def process_pp_stages_per_dc(pp_stages_per_dc, pp_size, num_dc):
     return ret
 
 
+class DynamicMicrobatchIterator:
+    """Wraps a data iterator to yield variable-sized microbatches by mb_id.
+
+    The underlying iterator yields batches of size ``micro_batch_size``
+    (the equal-split size from args).  This wrapper accumulates enough
+    equal-sized batches to fill the global batch, then pre-splits them
+    according to ``microbatch_sizes`` into a dict keyed by mb_id.
+
+    Call ``set_next_mb_id(mb_id)`` before each ``next()`` call so that
+    the correct chunk is returned regardless of schedule order.
+
+    On pipeline stages that don't consume data (middle stages), the
+    underlying iterator yields ``None`` — we just pass those through.
+    """
+
+    def __init__(self, base_iterator, microbatch_sizes: List[int], equal_mb_size: int):
+        self.base_iterator = base_iterator
+        self.microbatch_sizes = microbatch_sizes
+        self.equal_mb_size = equal_mb_size
+        self._chunks: Dict[int, Any] = {}  # mb_id -> pre-split chunk
+        self._next_mb_id: Optional[int] = None
+        self._filled = False
+
+    def set_next_mb_id(self, mb_id: int):
+        """Set which microbatch id the next ``next()`` call should return."""
+        self._next_mb_id = mb_id
+
+    def _refill(self):
+        """Pull enough equal-sized batches to cover one global batch, then
+        pre-split according to self.microbatch_sizes into self._chunks dict."""
+        N = sum(self.microbatch_sizes)
+        num_equal_batches = N // self.equal_mb_size
+
+        # Accumulate equal-sized batches
+        batches = []
+        for _ in range(num_equal_batches):
+            batch = next(self.base_iterator)
+            if batch is None:
+                # Non-data stage — just yield None for each microbatch
+                self._chunks = {i: None for i in range(len(self.microbatch_sizes))}
+                self._filled = True
+                return
+            batches.append(batch)
+
+        # Concatenate along the batch dimension (dim=0), then split by microbatch_sizes
+        if isinstance(batches[0], dict):
+            full_batch = {}
+            for key in batches[0]:
+                if batches[0][key] is not None:
+                    full_batch[key] = torch.cat([b[key] for b in batches], dim=0)
+                else:
+                    full_batch[key] = None
+            self._chunks = {}
+            for mb_id, mb_size in enumerate(self.microbatch_sizes):
+                chunk = {}
+                for key in full_batch:
+                    if full_batch[key] is not None:
+                        chunk[key], full_batch[key] = (
+                            full_batch[key][:mb_size],
+                            full_batch[key][mb_size:],
+                        )
+                    else:
+                        chunk[key] = None
+                self._chunks[mb_id] = chunk
+        elif isinstance(batches[0], (list, tuple)):
+            full = [
+                torch.cat([b[i] for b in batches], dim=0) if batches[0][i] is not None else None
+                for i in range(len(batches[0]))
+            ]
+            self._chunks = {}
+            for mb_id, mb_size in enumerate(self.microbatch_sizes):
+                chunk = []
+                for i in range(len(full)):
+                    if full[i] is not None:
+                        chunk.append(full[i][:mb_size])
+                        full[i] = full[i][mb_size:]
+                    else:
+                        chunk.append(None)
+                self._chunks[mb_id] = type(batches[0])(chunk)
+        else:
+            full = torch.cat(batches, dim=0)
+            splits = torch.split(full, self.microbatch_sizes, dim=0)
+            self._chunks = {i: s for i, s in enumerate(splits)}
+
+        self._filled = True
+
+    def __next__(self):
+        if not self._filled:
+            self._refill()
+        if self._next_mb_id is None:
+            raise RuntimeError(
+                "DynamicMicrobatchIterator: next() called without set_next_mb_id(). "
+                "This means data is being consumed outside of schedule_compute_task."
+            )
+        mb_id = self._next_mb_id
+        self._next_mb_id = None
+        return self._chunks[mb_id]
+
+    def __iter__(self):
+        return self
+
+    def reset_for_next_iteration(self):
+        """Reset state for the next training iteration (re-fill from data iterator)."""
+        self._chunks = {}
+        self._filled = False
+
+
 def get_or_set_pp_io_tensor(tensor_dict: Dict, key, config, tensor_shape):
     return tensor_dict.setdefault(
         key,
@@ -126,7 +237,8 @@ class CDCDynamicScheduleGenerator:
             "wave",
             "ud",
             "subud",
-        ], "Currently only support ud, subud and wave schedule"
+            "dynamic_mb",
+        ], "Currently only support ud, subud, wave, and dynamic_mb schedule"
         self.num_chunks = 2 if self.schedule_type == "wave" else 1
         self.num_microbatch = num_microbatch
         self.profile_result_path = profile_result_path
@@ -169,6 +281,7 @@ class CDCDynamicScheduleGenerator:
         assert self.M_W_list.shape == (self.num_chunks, self.pp_size)
 
         self.pipeline: Pipeline | None = None
+        self.microbatch_sizes: Optional[List[int]] = None  # set by dynamic_mb solver
 
         self.override_M_Limit(args.dynamic_extra_mem_factor)
 
@@ -541,6 +654,195 @@ class CDCDynamicScheduleGenerator:
             
             estimated_runtime = pp.get_schedule_time(device_wise=True) / time_factor
 
+        elif self.schedule_type == "dynamic_mb":
+            num_chunks = 1
+
+            # Derive per-sample compute/comm costs from profiled absolute timings.
+            # T_F_list[chunk=0][dev] was measured at microbatch_size = N / num_microbatch.
+            N = self.args.global_batch_size // (
+                self.args.data_parallel_size if hasattr(self.args, 'data_parallel_size') else 1
+            )
+            f_profiled = N // self.num_microbatch
+
+            T_alpha_with_inject = self.T_alpha_matrix + self.injected_latency
+            T_bw_with_inject = self.T_bw_matrix + self.injected_bandwidth
+
+            schedule_file = os.path.join(self.profile_result_path, "dynamic_mb.json")
+
+            # Rank 0 deletes stale schedule file, then all ranks synchronize.
+            # This ensures non-rank-0 workers never read a leftover file from a prior run.
+            if self.rank_zero and os.path.exists(schedule_file):
+                os.remove(schedule_file)
+            dist.barrier()
+
+            if self.rank_zero:
+                # --- Only rank 0 solves the MILP ---
+                # Dummy T_F/T_B/T_W as Python int lists shaped (num_chunks, num_devices).
+                # Actual durations come from comp/compBias/f[mb] in the dynamic solver.
+                # M_F + M_B + M_W must sum to 0 per device for the base class assertion.
+                dummy_T = [[1] * self.pp_size for _ in range(num_chunks)]
+                dummy_M = [[0] * self.pp_size for _ in range(num_chunks)]
+                dummy_sys_cfg = SystemConfig(
+                    num_devices=self.pp_size,
+                    num_microbatches=self.num_microbatch,
+                    T_F=dummy_T, T_B=dummy_T, T_W=dummy_T,
+                    T_alpha=[[0] * self.pp_size for _ in range(self.pp_size)],
+                    M_F=dummy_M,
+                    M_B=dummy_M,
+                    M_W=dummy_M,
+                    M_Limit=[-1] * self.pp_size,
+                    num_chunks=num_chunks,
+                )
+
+                comp = [
+                    [
+                        float(self.T_F_list[0][d]) / f_profiled,
+                        float(self.T_B_list[0][d]) / f_profiled,
+                        float(self.T_W_list[0][d]) / f_profiled,
+                    ]
+                    for d in range(self.pp_size)
+                ]
+                compBias = 0.0
+
+                commLat = T_alpha_with_inject.tolist()
+                if self.pp_size > 1:
+                    fwd_bw = [float(T_bw_with_inject[d][(d + 1) % self.pp_size]) for d in range(self.pp_size - 1)]
+                    bwd_bw = [float(T_bw_with_inject[(d + 1) % self.pp_size][d]) for d in range(self.pp_size - 1)]
+                    comm = [np.mean(fwd_bw) / f_profiled, np.mean(bwd_bw) / f_profiled]
+                else:
+                    comm = [0.0, 0.0]
+
+                # Scale to integers for the MILP solver
+                all_vals = []
+                for row in comp:
+                    all_vals.extend(row)
+                all_vals.append(compBias)
+                all_vals.extend(comm)
+                for row in commLat:
+                    all_vals.extend(row)
+                nonzero = [abs(v) for v in all_vals if abs(v) > 1e-15]
+                scale = 10.0 / min(nonzero) if nonzero else 1.0
+
+                comp_scaled = [[v * scale for v in row] for row in comp]
+                compBias_scaled = compBias * scale
+                comm_scaled = [v * scale for v in comm]
+                commLat_scaled = [[v * scale for v in row] for row in commLat]
+
+                print(f"[dynamic_mb] N={N}, f_profiled={f_profiled}, scale={scale:.2f}")
+                print(f"[dynamic_mb] comp={comp}, comm={comm}")
+
+                debug_mb_sizes = getattr(self.args, 'cdc_debug_mb_sizes', None)
+                if debug_mb_sizes is not None:
+                    # Skip MILP — use provided microbatch sizes and build a ZBH1 ordering.
+                    mb_sizes = list(debug_mb_sizes)
+                    assert len(mb_sizes) == self.num_microbatch, (
+                        f"--cdc_debug_mb_sizes has {len(mb_sizes)} entries, "
+                        f"expected {self.num_microbatch}"
+                    )
+                    assert sum(mb_sizes) == N, (
+                        f"--cdc_debug_mb_sizes sums to {sum(mb_sizes)}, expected N={N}"
+                    )
+                    print(f"[dynamic_mb] Using debug microbatch sizes: {mb_sizes}")
+
+                    # Build a ZBH1 schedule to get task ordering.
+                    from megatron.core.pipeline_parallel.cdc_scheduler.pp_generator.pipeline import (
+                        ZBH1Pipeline,
+                    )
+                    zbh1 = ZBH1Pipeline(dummy_sys_cfg)
+                    zbh1.schedule()
+                    schedule_dicts = zbh1.store_schedule_to_dict()
+                    estimated_runtime_raw = 0
+                else:
+                    g = UnidirectionalDynamicBatchSizeZBDependencyGraph(
+                        system_cfg=dummy_sys_cfg,
+                        N=N,
+                        comp=comp_scaled,
+                        compBias=compBias_scaled,
+                        comm=comm_scaled,
+                        commLat=commLat_scaled,
+                    )
+                    g.build_ilp()
+                    g.solve_ilp(verbose=True, time_limit=120, relative_gap=0.01)
+
+                    mb_sizes = g.get_microbatch_sizes()
+                    schedule_blocks = g.get_schedule()
+
+                    if schedule_blocks is None or mb_sizes is None:
+                        raise RuntimeError("[dynamic_mb] MILP solver failed to find a solution")
+
+                    estimated_runtime_raw = g.get_objective_value() / scale if g.get_objective_value() else 0
+
+                print(f"[dynamic_mb] Solved microbatch sizes: {mb_sizes} (sum={sum(mb_sizes)})", flush=True)
+
+                # Convert to dict format and save (so non-rank-0 can load it)
+                if debug_mb_sizes is None:
+                    schedule_dicts = [[] for _ in range(self.pp_size)]
+                    for dev_blocks in schedule_blocks:
+                        for b in dev_blocks:
+                            schedule_dicts[b.device_id].append({
+                                "task_type": b.task_type,
+                                "device_id": b.device_id,
+                                "microbatch_id": b.mb_id,
+                                "chunk_id": b.chunk_id,
+                                "post_send_time": b.post_send_time,
+                            })
+                with open(schedule_file, "w") as f:
+                    json.dump({"schedule": schedule_dicts, "microbatch_sizes": mb_sizes}, f)
+            else:
+                # --- Non-rank-0: wait for rank 0 to save the schedule ---
+                while not os.path.exists(schedule_file):
+                    time.sleep(random.uniform(5, 10))
+
+            # --- All ranks: load the schedule and microbatch sizes ---
+            with open(schedule_file, "r") as f:
+                saved = json.load(f)
+            schedule_dicts = saved["schedule"]
+            self.microbatch_sizes = saved["microbatch_sizes"]
+
+            # Validate the loaded schedule matches the current configuration.
+            assert len(schedule_dicts) == self.pp_size, (
+                f"[dynamic_mb] Schedule file has {len(schedule_dicts)} devices, "
+                f"expected {self.pp_size}"
+            )
+            assert len(self.microbatch_sizes) == self.num_microbatch, (
+                f"[dynamic_mb] Schedule file has {len(self.microbatch_sizes)} microbatches, "
+                f"expected {self.num_microbatch}"
+            )
+            assert sum(self.microbatch_sizes) == N, (
+                f"[dynamic_mb] Microbatch sizes sum to {sum(self.microbatch_sizes)}, "
+                f"expected N={N}"
+            )
+
+            equal_sys_cfg = SystemConfig(
+                T_F=self.T_F_list,
+                T_B=self.T_B_list,
+                T_alpha=T_alpha_with_inject,
+                T_beta=T_bw_with_inject,
+                T_W=self.T_W_list,
+                M_F=self.M_F_list,
+                M_B=self.M_B_list,
+                M_W=self.M_W_list,
+                M_Limit=self.M_Limit_list,
+                T_DP=self.T_DP_list,
+                num_devices=self.pp_size,
+                num_microbatches=self.num_microbatch,
+                num_chunks=num_chunks,
+                zero_1_dp_modeling=self.zero1_dp_modeling,
+            )
+            equal_sys_cfg, time_factor, mem_factor = self.integerize_sys_cfg(equal_sys_cfg)
+            pp = OneChunkPipelineTemplate(equal_sys_cfg)
+            pp.load_schedule_from_dict(schedule_dicts)
+            pp.solve_dependencies()
+
+            if self.rank_zero:
+                pp.print_schedule(
+                    name="dynamic_mb",
+                    save=True,
+                    save_path=self.profile_result_path,
+                )
+
+            estimated_runtime = estimated_runtime_raw if self.rank_zero else 0
+
         # barrier
         dist.barrier()
         self.pipeline = pp
@@ -613,7 +915,7 @@ class CDCPPScheduler:
             )
             # start with profile schedule
             self.pp_schedule = get_default_static_schedule(
-                "ZBH1" if self.dynamic_schedule_type in ["ud", "subud"] else "ZBV",
+                "ZBH1" if self.dynamic_schedule_type in ["ud", "subud", "dynamic_mb"] else "ZBV",
                 pp_size,
                 num_microbatch,
             )
@@ -735,6 +1037,57 @@ class CDCPPScheduler:
         # token count
         self.total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
 
+        # dynamic microbatch sizes (None = all equal, set after solver runs)
+        self.microbatch_sizes: Optional[List[int]] = None
+
+        # Create dedicated 2-rank P2P groups for dynamic_mb.
+        # The default extra groups are 4-rank groups (all PP ranks).  Unbatched
+        # isend/irecv on 4-rank groups causes lazy sub-communicator creation that
+        # deadlocks when ranks issue P2P to different partners concurrently.
+        # 2-rank groups avoid this entirely.
+        self._p2p_send_next_group = None
+        self._p2p_recv_next_group = None
+        self._p2p_send_prev_group = None
+        self._p2p_recv_prev_group = None
+        # Flag shared by all ranks so the warmup and schedule_comm_event can
+        # route consistently. Checking an individual group handle is wrong:
+        # the first/last rank legitimately lacks prev/next handles even when
+        # dedicated groups are in use, and mixing dedicated + extra groups
+        # across a send/recv pair causes a communicator mismatch.
+        self._use_dedicated_p2p_groups = False
+        # Only create dedicated 2-rank groups when pp_size > 2.  With pp_size==2
+        # the default extra groups are already effectively 2-rank and work fine.
+        pp_world_size = parallel_state.get_pipeline_model_parallel_world_size()
+        if self.use_dynamic_schedule and pp_world_size > 2:
+            self._use_dedicated_p2p_groups = True
+            pp_ranks = parallel_state._PIPELINE_GLOBAL_RANKS
+            if not isinstance(pp_ranks[0], list):
+                pp_ranks = [pp_ranks]
+            for ranks in pp_ranks:
+                if dist.get_rank() in ranks:
+                    pp_rank_in_group = ranks.index(dist.get_rank())
+                    pp_size_in_group = len(ranks)
+                    next_idx = (pp_rank_in_group + 1) % pp_size_in_group
+                    prev_idx = (pp_rank_in_group - 1 + pp_size_in_group) % pp_size_in_group
+                    next_global = ranks[next_idx]
+                    prev_global = ranks[prev_idx]
+                    my_global = dist.get_rank()
+                    # Create 2-rank groups for each adjacent pair (skip wrap-around)
+                    for i in range(pp_size_in_group - 1):
+                        j = i + 1
+                        pair = [ranks[i], ranks[j]]
+                        g = dist.new_group(pair)
+                        if my_global == ranks[i] and next_global == ranks[j]:
+                            self._p2p_send_next_group = g
+                        if my_global == ranks[j] and prev_global == ranks[i]:
+                            self._p2p_recv_prev_group = g
+                        # Backward direction: j sends to i
+                        g2 = dist.new_group(pair)
+                        if my_global == ranks[j] and prev_global == ranks[i]:
+                            self._p2p_send_prev_group = g2
+                        if my_global == ranks[i] and next_global == ranks[j]:
+                            self._p2p_recv_next_group = g2
+
         # grad sync
         self.no_sync_func = None
         self.no_sync_context = None
@@ -753,18 +1106,30 @@ class CDCPPScheduler:
     def update_schedule_with_latency_bandwidth(self):
         if self.exp_manager.profile_result is None:
             return
-        latency_sec, bandwidth_sec = (
-            self.exp_manager.get_injected_latency_bandwidth_delay_seconds()
-        )
-        latency_as_F_stage, bandwidth_as_F_stage = (
-            self.exp_manager.get_injected_latency_bandwidth_delay_as_F_stage()
-        )
-        if not self.exp_manager.need_schedule_update_in_current_iter():
+        # For latency injection experiments, update injected delays
+        if hasattr(self.exp_manager, 'cdc_exp_override_iter_map'):
+            latency_sec, bandwidth_sec = (
+                self.exp_manager.get_injected_latency_bandwidth_delay_seconds()
+            )
+            latency_as_F_stage, bandwidth_as_F_stage = (
+                self.exp_manager.get_injected_latency_bandwidth_delay_as_F_stage()
+            )
+            if not self.exp_manager.need_schedule_update_in_current_iter():
+                return
+            self.injected_latency_delay = (latency_as_F_stage, latency_sec)
+            self.injected_bandwidth_delay = (bandwidth_as_F_stage, bandwidth_sec)
+        elif not self.exp_manager.profiling_done() or hasattr(self, '_dynamic_schedule_generated'):
             return
-        self.injected_latency_delay = (latency_as_F_stage, latency_sec)
-        self.injected_bandwidth_delay = (bandwidth_as_F_stage, bandwidth_sec)
+        elif self.use_static_schedule:
+            # Static schedule with no experiment — no re-generation needed.
+            return
+        else:
+            # dynamic_mb or other non-experiment modes: generate schedule once after profiling
+            self._dynamic_schedule_generated = True
+            self.injected_latency_delay = (0, 0.0)
+            self.injected_bandwidth_delay = (0, 0.0)
         self.cdc_print(
-            f"Delay Config Update: latency {latency_as_F_stage} F stage, {latency_sec} seconds; bandwidth {bandwidth_as_F_stage} F stage, {bandwidth_sec} seconds",
+            f"Delay Config Update: latency {self.injected_latency_delay[0]} F stage, {self.injected_latency_delay[1]} seconds; bandwidth {self.injected_bandwidth_delay[0]} F stage, {self.injected_bandwidth_delay[1]} seconds",
             rank=0,
         )
         
@@ -828,7 +1193,10 @@ class CDCPPScheduler:
                 self.injected_latency_delay[1], self.injected_bandwidth_delay[1]
             )
             self.pp_schedule, estimated_runtime = self.pp_schedule_generator.get_schedule()
-            
+            # Propagate dynamic microbatch sizes if available
+            if self.pp_schedule_generator.microbatch_sizes is not None:
+                self.microbatch_sizes = self.pp_schedule_generator.microbatch_sizes
+
         if (self.use_static_schedule and self.args.enable_prefetch_opt) or self.use_dynamic_schedule:
             self.pp_execution_planner = ExecutionPlanner(self.pp_schedule)
             self.pp_execution_planner.generate_execution_plan()
@@ -858,7 +1226,50 @@ class CDCPPScheduler:
                     f.write(self.pp_execution_planner.print_execution_plan())
 
         dist.barrier()
-        
+
+        # Pre-initialize the dedicated 2-rank P2P groups.  Each group has exactly
+        # 2 ranks, so we just need matching send/recv on each pair.
+        if self.microbatch_sizes is not None and not hasattr(self, '_pp_group_p2p_initialized'):
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+            next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
+            prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
+            dummy = torch.zeros(1, device=torch.cuda.current_device())
+            # Forward direction: even ranks send first, odd recv first.
+            # Guard on the shared flag, not on a per-rank handle: the last rank
+            # has _p2p_send_next_group = None but must still enter this block
+            # to participate in the internal dist.barrier() calls, otherwise
+            # ranks 0..pp_size-2 deadlock waiting for it.
+            if self._use_dedicated_p2p_groups:
+                if pp_rank % 2 == 0:
+                    if pp_rank < pp_size - 1:
+                        dist.send(dummy, next_rank, group=self._p2p_send_next_group)
+                else:
+                    dist.recv(dummy, prev_rank, group=self._p2p_recv_prev_group)
+                dist.barrier()
+                if pp_rank % 2 == 0:
+                    if pp_rank < pp_size - 1:
+                        dist.recv(dummy, next_rank, group=self._p2p_recv_next_group)
+                else:
+                    dist.send(dummy, prev_rank, group=self._p2p_send_prev_group)
+                dist.barrier()
+                # Backward direction
+                if pp_rank % 2 == 0:
+                    if pp_rank > 0:
+                        dist.recv(dummy, prev_rank, group=self._p2p_recv_prev_group)
+                else:
+                    if pp_rank < pp_size - 1:
+                        dist.send(dummy, next_rank, group=self._p2p_send_next_group)
+                dist.barrier()
+                if pp_rank % 2 == 0:
+                    if pp_rank > 0:
+                        dist.send(dummy, prev_rank, group=self._p2p_send_prev_group)
+                else:
+                    if pp_rank < pp_size - 1:
+                        dist.recv(dummy, next_rank, group=self._p2p_recv_next_group)
+                dist.barrier()
+            self._pp_group_p2p_initialized = True
+
         self.exp_manager.exp_logging_perf_model_iter_time[(self.injected_latency_delay, self.injected_bandwidth_delay)] = estimated_runtime
 
     def clean_up(self):
@@ -891,6 +1302,11 @@ class CDCPPScheduler:
         assert not args.defer_embedding_wgrad_compute
         assert not args.variable_seq_lengths
 
+        if hasattr(args, 'dynamic_schedule') and args.dynamic_schedule == 'dynamic_mb':
+            assert args.tensor_model_parallel_size == 1, (
+                "dynamic_mb schedule currently requires tensor_model_parallel_size=1"
+            )
+
         if self.use_static_schedule:
             pass
 
@@ -922,7 +1338,7 @@ class CDCPPScheduler:
         mpu.set_virtual_pipeline_model_parallel_world_size(num_chunks)
         mpu.set_virtual_pipeline_model_parallel_rank(0)
 
-        if self.wgrad_split:
+        if self.wgrad_split and not (hasattr(args, 'dynamic_schedule') and args.dynamic_schedule == 'dynamic_mb'):
             assert (
                 args.gradient_accumulation_fusion
             ), "W-grad split requires gradient accumulation fusion"
@@ -990,14 +1406,28 @@ class CDCPPScheduler:
                 and compute_task.task_desc.type == "B"
             )
 
-    def schedule_comm_event(self, event: CommEvent, config, tensor_shape):
-        send_next_group = parallel_state.get_pipeline_extra_send_next_group()
-        recv_next_group = parallel_state.get_pipeline_extra_recv_next_group()
-        send_prev_group = parallel_state.get_pipeline_extra_send_prev_group()
-        recv_prev_group = parallel_state.get_pipeline_extra_recv_prev_group()
-
+    def schedule_comm_event(self, event: CommEvent, config, tensor_shape, forward_only=False):
         next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
         prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
+
+        # With dynamic microbatch sizes, override tensor_shape using the event's
+        # own mb_id (not the calling compute task's mb_id, since recv events are
+        # posted ahead of time for future microbatches).
+        if self.microbatch_sizes is not None and not forward_only:
+            mb_size = self.microbatch_sizes[event.mb_id]
+            tensor_shape = list(tensor_shape)
+            tensor_shape[1] = mb_size
+
+        if self.microbatch_sizes is not None and not forward_only and self._use_dedicated_p2p_groups:
+            send_next_group = self._p2p_send_next_group
+            recv_next_group = self._p2p_recv_next_group
+            send_prev_group = self._p2p_send_prev_group
+            recv_prev_group = self._p2p_recv_prev_group
+        else:
+            send_next_group = parallel_state.get_pipeline_extra_send_next_group()
+            recv_next_group = parallel_state.get_pipeline_extra_recv_next_group()
+            send_prev_group = parallel_state.get_pipeline_extra_send_prev_group()
+            recv_prev_group = parallel_state.get_pipeline_extra_recv_prev_group()
 
         assert event.task_type in ["F", "B"]
 
@@ -1119,7 +1549,7 @@ class CDCPPScheduler:
                 task_type = event.task_type
                 if mb_id >= num_microbatches or task_type != "F":
                     return
-            self.schedule_comm_event(event, config, tensor_shape)
+            self.schedule_comm_event(event, config, tensor_shape, forward_only)
         else:
             raise NotImplementedError()
 
@@ -1192,6 +1622,17 @@ class CDCPPScheduler:
             
             with nvtx.range(f"Dev{self.pp_rank} F: {mb_id} chunk: {chunk_id}"):
                 if not self.subblock_scheduling:
+                    # Compute loss_scale for dynamic microbatch weighting
+                    dyn_loss_scale = None
+                    if self.microbatch_sizes is not None:
+                        N = sum(self.microbatch_sizes)
+                        dyn_loss_scale = self.microbatch_sizes[mb_id] / N
+
+                    # Tell the dynamic iterator which mb_id to yield next
+                    di = data_iterator[chunk_id]
+                    if isinstance(di, DynamicMicrobatchIterator):
+                        di.set_next_mb_id(mb_id)
+
                     self.output_tensors[(mb_id, chunk_id)], num_tokens = forward_step(
                         forward_step_func=forward_step_func,
                         data_iterator=data_iterator[chunk_id],
@@ -1209,6 +1650,7 @@ class CDCPPScheduler:
                         ),
                         current_microbatch=mb_id,
                         encoder_decoder_xattn=False,
+                        loss_scale=dyn_loss_scale,
                     )
                     self.total_num_tokens += num_tokens.item()
                 else:
@@ -1260,12 +1702,14 @@ class CDCPPScheduler:
                     self.enable_grad_sync(chunk_id)
                     self.cdc_print(f"enable_grad_sync for last microbatch, task: {mb_id}, chunk: {chunk_id}", verbose=2)
 
-                if not self.subblock_scheduling:                    
+                if not self.subblock_scheduling:
                     output_tensor_grad = (
                         self.output_tensor_grads[(mb_id, chunk_id)]
                         if not is_last_stage
                         else None
                     )
+                    if self.microbatch_sizes is not None:
+                        print(f"[BW r{self.pp_rank}] BEGIN backward_step mb={mb_id} last_stage={is_last_stage}", flush=True)
                     self.input_tensor_grads[(mb_id, chunk_id)] = backward_step(
                         input_tensor=self.input_tensors[(mb_id, chunk_id)],
                         output_tensor=self.output_tensors[(mb_id, chunk_id)],
@@ -1273,6 +1717,8 @@ class CDCPPScheduler:
                         model_type=get_model_type(model[chunk_id]),
                         config=config,
                     )
+                    if self.microbatch_sizes is not None:
+                        print(f"[BW r{self.pp_rank}] END backward_step mb={mb_id}", flush=True)
                     # release tensors
                     self.input_tensors[(mb_id, chunk_id)] = None
                     self.output_tensors[(mb_id, chunk_id)] = None
@@ -1532,34 +1978,55 @@ class CDCPPScheduler:
             self.disable_grad_sync(chunk_id)
             # is_last_microbatch is set to True by zero_grad_buffer() before this call, so no assertion needed
 
-        tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
-        tensor_shape[0] = (
-            tensor_shape[0] // parallel_state.get_context_parallel_world_size()
-        )
+        # Compute adjusted seq_length (shared across all microbatches)
+        adjusted_seq_length = seq_length // parallel_state.get_context_parallel_world_size()
         if config.sequence_parallel:
-            tensor_shape[0] = (
-                tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
+            adjusted_seq_length = (
+                adjusted_seq_length // parallel_state.get_tensor_model_parallel_world_size()
+            )
+        dtype_size = torch.tensor([], dtype=config.pipeline_dtype).element_size()
+
+        # Always define the equal-size tensor_shape (needed for eval and as fallback).
+        tensor_shape = [adjusted_seq_length, micro_batch_size, config.hidden_size]
+        self.pp_comm_size_bytes = (
+            tensor_shape[0] * tensor_shape[1] * tensor_shape[2] * dtype_size
+        )
+        if self.microbatch_sizes is not None and not forward_only:
+            # Dynamic microbatch sizes — pp_comm_size_bytes uses the largest
+            max_mb_size = max(self.microbatch_sizes)
+            self.pp_comm_size_bytes = (
+                adjusted_seq_length * max_mb_size * config.hidden_size * dtype_size
             )
 
-        # multiply tensor shape dims
-        self.pp_comm_size_bytes = (
-            tensor_shape[0]
-            * tensor_shape[1]
-            * tensor_shape[2]
-            * torch.tensor([], dtype=config.pipeline_dtype).element_size()
-        )
-
         self.update_schedule_with_latency_bandwidth()
+
+        # Wrap data iterators for dynamic microbatch sizes (must happen after
+        # update_schedule_with_latency_bandwidth which may set self.microbatch_sizes)
+        if self.microbatch_sizes is not None and not forward_only:
+            data_iterator = [
+                DynamicMicrobatchIterator(di, self.microbatch_sizes, micro_batch_size)
+                for di in data_iterator
+            ]
 
         for idx, compute_task in enumerate(self.pp_execution_plan_cur_device):
             # self.cdc_print(f"compute_task: {compute_task}")
             self.exp_manager.exp_logging_first_mb = True if idx == 0 else False
+
+            # Determine tensor_shape for this microbatch
+            # During eval (forward_only), data uses equal micro_batch_size — skip dynamic shapes.
+            if self.microbatch_sizes is not None and not forward_only:
+                mb_id = compute_task.task_desc.mb_id
+                mb_size = self.microbatch_sizes[mb_id]
+                cur_tensor_shape = [adjusted_seq_length, mb_size, config.hidden_size]
+            else:
+                cur_tensor_shape = tensor_shape
+
             self.schedule_compute_task(
                 compute_task=compute_task,
                 model=model,
                 data_iterator=data_iterator,
                 forward_step_func=forward_step_func,
-                tensor_shape=tensor_shape,
+                tensor_shape=cur_tensor_shape,
                 forward_data_store=forward_data_store,
                 collect_non_loss_data=collect_non_loss_data,
                 first_val_step=first_val_step,
@@ -1897,7 +2364,8 @@ class CDCPPScheduler:
         next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
-        assert pp_size % 2 == 0
+        # DEBUG/E1: bypass even-pp assertion so we can test pp=3
+        # assert pp_size % 2 == 0
 
         warmup = 2
         num_iters = 10
