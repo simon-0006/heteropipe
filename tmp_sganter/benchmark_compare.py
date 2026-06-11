@@ -1,10 +1,19 @@
-"""Compare per-iteration times between ZBH1 and dynamic_mb benchmark runs.
+"""Compare per-iteration times across N labeled training-log files.
 
 Usage:
-    python tmp_sganter/benchmark_compare.py \
-        --zbh1 zbh1_run.log \
-        --dynamic dynamic_mb_run.log \
-        [--warmup 10]
+    python tmp_sganter/benchmark_compare.py \\
+        --log "ZBH1=path/to/zbh1.log=[4]*16" \\
+        --log "dyn_eq=path/to/dyn_eq.log=[4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4]" \\
+        --log "dyn_var=path/to/dyn_var.log=[1,2,3,3,3,4,4,9,10,8,5,4,3,2,2,1]" \\
+        [--warmup 10] [--baseline-label ZBH1]
+
+Format of --log: "LABEL=PATH=MB_SIZES" (= as separator). MB_SIZES is a freeform
+string (it is only used as a column value in the output table, never parsed).
+The first --log is the baseline against which other rows compute the
+percentage delta unless --baseline-label is given.
+
+Outputs both a per-config summary block and a Markdown comparison table
+that can be pasted directly into a report.
 """
 import argparse
 import re
@@ -17,7 +26,6 @@ ITER_RE = re.compile(
 
 
 def parse_log(path: Path) -> list[tuple[int, float]]:
-    """Return list of (iteration, elapsed_ms) from a training log."""
     out = []
     with open(path) as f:
         for line in f:
@@ -62,59 +70,113 @@ def print_stats(name: str, st: dict):
     print(f"    max     = {st['max']:8.2f} ms")
 
 
+def parse_log_spec(spec: str) -> tuple[str, Path, str]:
+    """Split LABEL=PATH=MB_SIZES on the first two '=' so that MB_SIZES may
+    contain '=' characters itself (it usually won't, but be safe)."""
+    parts = spec.split("=", 2)
+    if len(parts) != 3:
+        sys.exit(
+            f"error: --log expects LABEL=PATH=MB_SIZES, got: {spec!r}"
+        )
+    label, path, mbsizes = parts
+    return label.strip(), Path(path.strip()), mbsizes.strip()
+
+
+def fmt_delta(value: float, base: float, key: str) -> str:
+    if base == 0:
+        return ""
+    delta = value - base
+    pct = (delta / base) * 100
+    return f"{pct:+.1f} %"
+
+
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--zbh1", required=True, type=Path)
-    p.add_argument("--dynamic", required=True, type=Path)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument(
+        "--log",
+        action="append",
+        required=True,
+        metavar="LABEL=PATH=MB_SIZES",
+        help="repeatable; provide one --log per run to compare",
+    )
     p.add_argument("--warmup", type=int, default=10,
                    help="Skip the first N iterations (default: 10)")
+    p.add_argument("--baseline-label", default=None,
+                   help="Label of the row to use as the comparison baseline "
+                        "(default: the first --log)")
     args = p.parse_args()
 
-    for path in (args.zbh1, args.dynamic):
+    specs = [parse_log_spec(s) for s in args.log]
+    if len(specs) < 1:
+        sys.exit("error: need at least one --log")
+
+    rows = []
+    for label, path, mbsizes in specs:
         if not path.exists():
-            sys.exit(f"error: {path} not found")
+            sys.exit(f"error: {path} not found (label={label})")
+        iters = parse_log(path)
+        vals = [t for (i, t) in iters if i > args.warmup]
+        rows.append({
+            "label": label,
+            "path": path,
+            "mbsizes": mbsizes,
+            "raw_count": len(iters),
+            "stats": stats(vals),
+        })
 
-    zbh1 = parse_log(args.zbh1)
-    dyn = parse_log(args.dynamic)
-
-    print(f"Raw iterations parsed: zbh1={len(zbh1)}, dynamic={len(dyn)}")
-
-    # Filter: skip warmup (keep iter > warmup)
-    zbh1_vals = [t for (i, t) in zbh1 if i > args.warmup]
-    dyn_vals = [t for (i, t) in dyn if i > args.warmup]
-
-    print(f"After skipping first {args.warmup} warmup iterations: "
-          f"zbh1={len(zbh1_vals)}, dynamic={len(dyn_vals)}")
+    print("Parsed iterations per log "
+          f"(post-warmup of {args.warmup} iters):")
+    for r in rows:
+        st = r["stats"]
+        print(f"  {r['label']:<20s} raw={r['raw_count']:>4d}  "
+              f"after-warmup={st['n']:>4d}  ({r['path']})")
     print()
 
-    zbh1_st = stats(zbh1_vals)
-    dyn_st = stats(dyn_vals)
-
+    # Per-row summary blocks
+    for r in rows:
+        print("=" * 60)
+        print(f"{r['label']}   mb_sizes={r['mbsizes']}")
+        print_stats("iteration time", r["stats"])
     print("=" * 60)
-    print("ZBH1 (baseline)")
-    print_stats("iteration time", zbh1_st)
     print()
-    print("dynamic_mb")
-    print_stats("iteration time", dyn_st)
-    print("=" * 60)
 
-    if zbh1_st["n"] and dyn_st["n"]:
-        print()
-        print("Comparison (dynamic_mb vs ZBH1):")
-        for key in ("mean", "median", "p25", "p75"):
-            zb = zbh1_st[key]
-            dy = dyn_st[key]
-            delta = dy - zb
-            pct = (delta / zb) * 100 if zb else 0
-            sign = "faster" if delta < 0 else "slower"
-            print(f"  {key:7s}: {zb:8.2f} ms  ->  {dy:8.2f} ms   "
-                  f"({abs(delta):+6.2f} ms, {pct:+6.2f}%, {sign})")
+    # Comparison table
+    baseline_label = args.baseline_label or rows[0]["label"]
+    baseline = next((r for r in rows if r["label"] == baseline_label), None)
+    if baseline is None:
+        sys.exit(f"error: baseline-label {baseline_label!r} not found")
+    base_st = baseline["stats"]
 
-        # Throughput-oriented comparison (samples/sec)
-        # Assumes same global_batch_size — which is true for these runs.
-        print()
-        speedup = zbh1_st["mean"] / dyn_st["mean"]
-        print(f"Speedup (zbh1_mean / dynamic_mean): {speedup:.3f}x")
+    print(f"Comparison table  (baseline = {baseline_label}, "
+          f"deltas are vs baseline median)")
+    print()
+    header = (f"| {'Config':<18s} | {'mb_sizes':<48s} | "
+              f"{'median':>10s} | {'mean':>10s} | {'std':>8s} | "
+              f"{'vs baseline':>11s} |")
+    sep = "|" + "-" * (len(header) - 2) + "|"
+    sep = ("|" + "-" * 20 + "|" + "-" * 50 + "|"
+           + "-" * 12 + "|" + "-" * 12 + "|" + "-" * 10 + "|"
+           + "-" * 13 + "|")
+    print(header)
+    print(sep)
+    for r in rows:
+        st = r["stats"]
+        if st["n"] == 0:
+            print(f"| {r['label']:<18s} | {r['mbsizes']:<48s} | "
+                  f"{'(empty)':>10s} | {'':>10s} | {'':>8s} | {'':>11s} |")
+            continue
+        is_base = r["label"] == baseline_label
+        delta_str = "baseline" if is_base else fmt_delta(
+            st["median"], base_st["median"], "median")
+        med_str = f"{st['median']:.1f} ms"
+        mean_str = f"{st['mean']:.1f} ms"
+        std_str = f"{st['std']:.1f} ms"
+        # Highlight baseline with double-star? Keep plain for readability.
+        print(f"| {r['label']:<18s} | {r['mbsizes']:<48s} | "
+              f"{med_str:>10s} | {mean_str:>10s} | {std_str:>8s} | "
+              f"{delta_str:>11s} |")
 
 
 if __name__ == "__main__":
