@@ -375,11 +375,16 @@ class UnidirectionalZBDependencyGraph(DependencyGraph):
 class UnidirectionalDynamicBatchSizeZBDependencyGraph(UnidirectionalZBDependencyGraph):
     """ZB dependency graph where microbatch sizes are decision variables.
 
-    Task durations: comp[dev][type] * f[mb] + compBias
-    Comm durations: comm[dir]      * f[mb] + commLat[src][dst]
+    Task durations: comp[dev][type] * f[mb] + compBias[dev][type]
+    Comm durations: comm[dir]       * f[mb] + commLat[src][dst]
 
     The solver jointly optimises the schedule ordering AND the microbatch
     sizes f[0..num_mb-1] such that sum(f) == N.
+
+    ``compBias`` may be passed as a scalar (legacy single-point profile path:
+    same overhead applies to every (dev, op)) or as a 2D list
+    ``compBias[dev][op]`` (affine profile path: per-(dev, op) intercept).
+    Internally it is normalised to the 2D form.
     """
 
     def __init__(
@@ -387,7 +392,7 @@ class UnidirectionalDynamicBatchSizeZBDependencyGraph(UnidirectionalZBDependency
         system_cfg: SystemConfig,
         N: int,
         comp,       # comp[dev][type]: per-sample compute cost
-        compBias,   # fixed overhead per operation
+        compBias,   # scalar OR compBias[dev][type]: fixed overhead per task
         comm,       # comm[dir]: per-sample comm cost (0=fwd, 1=bwd)
         commLat,    # commLat[dev][dev']: fixed latency between devices
     ):
@@ -395,7 +400,14 @@ class UnidirectionalDynamicBatchSizeZBDependencyGraph(UnidirectionalZBDependency
         # actual durations come from comp/compBias/f[mb].
         self.N = N
         self.comp = comp
-        self.compBias = compBias
+        # Normalise compBias to compBias[dev][op] form. ``op`` indexes the
+        # per-task-type cost in the same order as ``comp[dev]`` (F, B, W).
+        if isinstance(compBias, (int, float)):
+            num_dev = len(comp)
+            num_ops = len(comp[0]) if num_dev > 0 else 3
+            self.compBias = [[float(compBias) for _ in range(num_ops)] for _ in range(num_dev)]
+        else:
+            self.compBias = [[float(v) for v in row] for row in compBias]
         self.comm = comm
         self.commLat = commLat
         self.prob_f = None  # will hold solved microbatch size variables
@@ -405,11 +417,12 @@ class UnidirectionalDynamicBatchSizeZBDependencyGraph(UnidirectionalZBDependency
     # --- LP expressions that depend on the microbatch size variables ---
 
     def _task_time_expr(self, node_id, f_vars):
-        """Return LP expression for duration of node: comp[dev][type] * f[mb] + compBias."""
+        """Return LP expression for duration of node:
+        ``comp[dev][type] * f[mb] + compBias[dev][type]``."""
         dev = self._get_dev(node_id)
         tt = self._get_task_type(node_id)
         mb = self._get_mb(node_id)
-        return self.comp[dev][tt] * f_vars[mb] + self.compBias
+        return self.comp[dev][tt] * f_vars[mb] + self.compBias[dev][tt]
 
     def _comm_cost_expr(self, prev_id, cur_id, f_vars):
         """Return LP expression for comm cost on a cross-device dependency edge.
@@ -460,8 +473,9 @@ class UnidirectionalDynamicBatchSizeZBDependencyGraph(UnidirectionalZBDependency
         max_comp = max(max(row) for row in self.comp)
         max_comm = max(self.comm) if any(c > 0 for c in self.comm) else 0
         max_lat = max(max(row) for row in self.commLat)
+        max_compBias = max(max(row) for row in self.compBias)
         bigM = (
-            3 * self.num_mb * (max_comp * self.N + self.compBias)
+            3 * self.num_mb * (max_comp * self.N + max_compBias)
             + self.num_mb * (max_comm * self.N + max_lat)
         )
 
@@ -527,10 +541,40 @@ class UnidirectionalDynamicBatchSizeZBDependencyGraph(UnidirectionalZBDependency
         self.prob_f = f_vars
 
     def get_microbatch_sizes(self) -> List[int]:
-        """Return solved microbatch sizes."""
+        """Return solved microbatch sizes.
+
+        The LP variables have ``lowBound=1, cat="Integer"`` and the
+        constraint ``sum(f) == N``. Integer solvers respect this exactly
+        in theory, but in practice the returned values can be 0.9999...
+        or N+0.0001 due to numerical tolerance. ``int()`` truncates
+        toward zero (so 0.9999 -> 0, violating lowBound=1), and the sum
+        of the truncated values may not equal N. Fix: round() each
+        value, clamp to >=1, then redistribute the residual onto the
+        largest microbatches so sum == N exactly.
+        """
         if self.prob_f is None:
             return None
-        return [int(value(fv)) for fv in self.prob_f]
+        raw = [max(1, int(round(value(fv)))) for fv in self.prob_f]
+        # Redistribute to enforce sum == N.
+        residual = self.N - sum(raw)
+        if residual != 0:
+            # Sort indices by current size (largest first). Add or
+            # subtract 1 from these in order until residual is 0,
+            # keeping every entry >= 1.
+            indices = sorted(range(len(raw)), key=lambda i: -raw[i])
+            i = 0
+            while residual != 0:
+                idx = indices[i % len(indices)]
+                if residual > 0:
+                    raw[idx] += 1
+                    residual -= 1
+                elif raw[idx] > 1:
+                    raw[idx] -= 1
+                    residual += 1
+                i += 1
+                if i > 10 * len(raw):
+                    break  # safety
+        return raw
 
     def get_schedule(self) -> List[List[PipelineBlockDesc]]:
         schedule = super().get_schedule()

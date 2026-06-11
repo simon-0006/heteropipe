@@ -1516,7 +1516,29 @@ def _add_distributed_args(parser):
     group.add_argument('--num_subparts', type=int, default=1, help='number of subparts in each chunk, must be enabled with subschedule and head_tail_as_one_layer')
     
     group.add_argument('--cdc_profile_iter', type=int, default=2, help='CDC profile iteration')
-    
+
+    group.add_argument('--cdc_profile_affine', action='store_true', default=False,
+                       help='Profile compute and communication time at multiple microbatch sizes and fit an affine model (slope*mbs + intercept). Output is consumed by the dynamic_mb MILP when set, and plotted to {profile_result_path}/affine_plots/. Coexists with the existing single-point scaling — disabled by default.')
+    group.add_argument('--cdc_profile_affine_sizes', type=int, nargs='+', default=None,
+                       help='Microbatch sizes to sweep for affine profiling. Default: powers of 2 up to N (per-DP global batch size), with 3 and 6 added as non-power-of-2 validation points if they fit.')
+    group.add_argument('--cdc_profile_affine_warmup_iters', type=int, default=2,
+                       help='Warmup iterations per (size, op) cell before timing the affine sweep.')
+    group.add_argument('--cdc_profile_affine_measure_iters', type=int, default=5,
+                       help='Measurement iterations per (size, op) cell — median is used.')
+    group.add_argument('--cdc_profile_affine_r2_threshold', type=float, default=0.7,
+                       help='Minimum R² required for an affine fit to be applied to the LP cost model. Cells whose fit falls below this threshold (typically because compute is launch-overhead-bound at small model sizes) keep the single-point T_op/f_profiled fallback. Set to 0 to apply every fit unconditionally.')
+    group.add_argument('--cdc_profile_affine_sanity_tol', type=float, default=0.20,
+                       help='Relative tolerance for the sanity check that compares the affine prediction at the profile-iter mbs against the canonical T_op measurement. Cells whose disagreement exceeds this fraction (default 20%%) trigger a warning but are still applied (the R² threshold is what decides whether they actually replace the fallback).')
+
+    # dynamic_mb LP regularisation: shape penalty (us per distinct microbatch shape)
+    # and an overridable upper bound on the per-microbatch size. Default
+    # max_f_cap = 0 means "uniform_size + 2" (the v11 default). Set to N to
+    # remove the cap entirely (LP can pick any f_i in [1, N]).
+    group.add_argument('--cdc_dynamic_mb_shape_penalty_us', type=float, default=500.0,
+                       help='Per-distinct-microbatch-shape penalty added to the dynamic_mb MILP objective, in microseconds. Regularises against the LP cost model\'s blind spot for per-shape runtime overhead (cuBLAS kernel selection, NCCL stream multiplexing, Python dispatcher). 0 disables.')
+    group.add_argument('--cdc_dynamic_mb_max_f_cap', type=int, default=0,
+                       help='Override the per-microbatch upper bound used by the dynamic_mb MILP. 0 (default) uses uniform_size + 2. Set to N (global batch) to disable the cap and let the LP pick any size in [1, N]; useful for investigating how much the cap restricts the search vs the penalty.')
+
     group.add_argument('--cdc_exp_logging', action='store_true', default=False, help='CDC experiment logging')
     group.add_argument('--cdc_exp_tf_block_size', type=int, default=0, help='Only for logging: CDC experiment transformer block size')    
     group.add_argument('--cdc_exp_dump_execution_plan', action='store_true', default=False, help='Dump execution plan for CDC experiment')
@@ -1530,8 +1552,23 @@ def _add_distributed_args(parser):
         except:
             raise argparse.ArgumentTypeError("Tuple must be float,float")
     group.add_argument('--cdc_latency_bandwidth_delay_as_F_stage', type=parse_tuple, nargs='+', default=[], help='CDC latency and bandwidth delay pairs as T_F * num_chunks, e,g, 0,0 0.5,0.5')
-    
-    
+
+    # Stock-PyTorch (no custom build) artificial latency injection. Uses
+    # torch.cuda._sleep on a dedicated send-side stream to delay isend without
+    # blocking default-stream compute. See tmp_sganter/docs/comm_delay_investigation.md.
+    group.add_argument('--cdc_stock_inject_latency_ms', type=float, default=0.0,
+                       help='Per-link artificial latency in ms (stock PyTorch, '
+                            'sender-side torch.cuda._sleep). 0 disables.')
+    group.add_argument('--cdc_stock_inject_warmup_iters', type=int, default=10,
+                       help='Skip injection for first N iters so cuBLAS warms '
+                            'its shape cache before latency starts gating sends.')
+    group.add_argument('--cdc_stock_inject_link', type=str, default='cross_boundary',
+                       choices=['none', 'cross_boundary', 'all'],
+                       help="Which sends get the spin. cross_boundary = only at "
+                            "DC-boundary links (matches --num_dc / --pp_stages_per_dc "
+                            "setup, like the existing flag). all = every send. "
+                            "none = injection disabled (same as latency_ms=0).")
+
     group.add_argument('--cdc_verbose_print', type=int, default=0, help='CDC verbose message for debugging, 1:info, 2:runtrace')
     group.add_argument('--cdc_print_rank', type=int, default=-1, help='CDC print rank, -1 means all ranks')
 

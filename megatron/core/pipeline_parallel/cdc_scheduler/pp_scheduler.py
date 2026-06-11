@@ -1,7 +1,9 @@
 import contextlib
+import cProfile
 import json
 import os
 import pickle
+import pstats
 import random
 import time
 from typing import Dict, Iterator, List, Optional, Tuple, Union
@@ -25,6 +27,11 @@ from megatron.core.pipeline_parallel.cdc_scheduler.wgrad_store import WGradStore
 from megatron.core.pipeline_parallel.cdc_scheduler.experiment_manager import (
     ExperimentManager,
 )
+try:
+    import pulp
+except ImportError:
+    pulp = None
+
 import torch
 import torch.distributed as dist
 import torch.cuda.nvtx as nvtx
@@ -54,6 +61,7 @@ from megatron.core.pipeline_parallel.cdc_scheduler.execution_planner import (
     ExecutionPlanner,
     TaskEvent,
 )
+from megatron.core.pipeline_parallel.cdc_scheduler import affine_profiler
 
 
 _CDC_PP_SCHEDULER = None
@@ -90,6 +98,18 @@ def str_keys_to_tuple(d):
     }
 
 
+def _floor_small_intercepts(compBias, comp, N, abs_floor_seconds=1e-6):
+    """Floor noise-floor intercepts to zero. Without this the integer-scaled
+    LP can pick up sub-microsecond regression artefacts and inflate
+    coefficient range. Mutates ``compBias`` in place. ``N`` and ``comp`` are
+    accepted for symmetry (currently unused — we only floor on absolute
+    seconds, not relative size). See issue (i) in the affine-profiler design."""
+    for d in range(len(compBias)):
+        for op in range(len(compBias[d])):
+            if compBias[d][op] < abs_floor_seconds:
+                compBias[d][op] = 0.0
+
+
 def process_pp_stages_per_dc(pp_stages_per_dc, pp_size, num_dc):
     if len(pp_stages_per_dc) == 0:
         # naive split
@@ -102,6 +122,39 @@ def process_pp_stages_per_dc(pp_stages_per_dc, pp_size, num_dc):
         sum(ret) == pp_size
     ), f"pp_stages_per_dc {ret} does not sum to pp_size {pp_size}"
     return ret
+
+
+def _slice_batch(batch, start, end):
+    """Slice rows [start, end) out of a base batch. Preserves the pinned
+    storage of the source tensor (a view into a pinned tensor is still
+    pinned for the purposes of non_blocking H2D transfers)."""
+    if isinstance(batch, dict):
+        return {k: (v[start:end] if v is not None else None) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(v[start:end] if v is not None else None for v in batch)
+    return batch[start:end]
+
+
+def _concat_batches(pieces):
+    """Concatenate aligned slices of the same batch type along dim=0."""
+    first = pieces[0]
+    if isinstance(first, dict):
+        out = {}
+        for key in first:
+            if first[key] is None:
+                out[key] = None
+            else:
+                out[key] = torch.cat([p[key] for p in pieces], dim=0)
+        return out
+    if isinstance(first, (list, tuple)):
+        out = []
+        for i in range(len(first)):
+            if first[i] is None:
+                out.append(None)
+            else:
+                out.append(torch.cat([p[i] for p in pieces], dim=0))
+        return type(first)(out)
+    return torch.cat(pieces, dim=0)
 
 
 class DynamicMicrobatchIterator:
@@ -117,6 +170,10 @@ class DynamicMicrobatchIterator:
 
     On pipeline stages that don't consume data (middle stages), the
     underlying iterator yields ``None`` — we just pass those through.
+
+    Chunks are kept at their true variable sizes — no padding. The
+    JIT-recv fix in ``schedule_comm_event`` makes that safe at pp >= 4
+    (see tmp_sganter/8_4gpu_hang_root_cause.md Update 16).
     """
 
     def __init__(self, base_iterator, microbatch_sizes: List[int], equal_mb_size: int):
@@ -126,6 +183,56 @@ class DynamicMicrobatchIterator:
         self._chunks: Dict[int, Any] = {}  # mb_id -> pre-split chunk
         self._next_mb_id: Optional[int] = None
         self._filled = False
+        # Debug fallbacks read once at construction (per-call os.environ.get
+        # in __next__ adds ~3 ms / iter at 1600 calls × ~2 µs).
+        self._disable_opt1 = os.environ.get("CDC_DISABLE_OPT1", "0") == "1"
+        self._disable_opt2 = os.environ.get("CDC_DISABLE_OPT2", "0") == "1"
+
+        # Per-mb chunk specs computed once: each spec is a tuple
+        #   (first_base, last_base, base_start_in_first, base_end_in_last,
+        #    is_whole_first_base_only)
+        # where the consumer reads bases [first_base..last_base], slices the
+        # first one at [base_start_in_first:], the last one at [:base_end_in_last],
+        # and concatenates the result. When the chunk lives in a single base and
+        # spans the whole base, ``is_whole_first_base_only`` lets us skip the
+        # slicing entirely (zero-copy passthrough).
+        self._chunk_specs = self._build_chunk_specs()
+        # Lazy-pull state (Opt 2): we only consume the underlying iterator as
+        # the scheduler asks for chunks, spreading the DataLoader's per-batch
+        # latency across the iteration instead of bursting all microbatches at
+        # once. Bursting was costing ~38 ms/iter in DataLoader-worker lock
+        # contention on the [4]*16 benchmark.
+        self._base_cache: List[Any] = []      # bases pulled so far (None for non-data stage)
+        self._non_data_stage = False
+
+    def _build_chunk_specs(self):
+        specs = []
+        k = self.equal_mb_size
+        cumsum = 0
+        for size in self.microbatch_sizes:
+            start = cumsum
+            end = cumsum + size
+            cumsum = end
+            first_base = start // k
+            last_base = (end - 1) // k
+            base_start = start - first_base * k
+            base_end = end - last_base * k
+            whole_first = first_base == last_base and base_start == 0 and base_end == k
+            specs.append((first_base, last_base, base_start, base_end, whole_first))
+        return specs
+
+    def _ensure_base_pulled(self, upto_idx):
+        """Pull bases from the underlying iterator until index `upto_idx` is
+        available in ``self._base_cache``."""
+        while len(self._base_cache) <= upto_idx:
+            batch = next(self.base_iterator)
+            if batch is None:
+                self._non_data_stage = True
+                # On non-data stages, the iterator yields None forever; cache a
+                # single sentinel and refuse to pull more.
+                self._base_cache.append(None)
+                return
+            self._base_cache.append(batch)
 
     def set_next_mb_id(self, mb_id: int):
         """Set which microbatch id the next ``next()`` call should return."""
@@ -133,11 +240,24 @@ class DynamicMicrobatchIterator:
 
     def _refill(self):
         """Pull enough equal-sized batches to cover one global batch, then
-        pre-split according to self.microbatch_sizes into self._chunks dict."""
+        compose per-mb chunks by slicing into the base batches (no upfront
+        concat). The earlier "concat all base batches then split" path lost
+        the pinned-memory property of the DataLoader output, which forced the
+        downstream ``.cuda(non_blocking=True)`` calls in
+        ``get_batch_on_this_tp_rank`` to fall back to a synchronous copy
+        (~65 ms/iter on the 4×H100 NVL benchmark). Slicing into the original
+        base-batch tensors preserves pinning when a chunk lives in a single
+        base batch, which is always true for equal-size schedules and most
+        chunks of variable-size schedules. Chunks that span multiple base
+        batches still need a concat — but that concat is now on much smaller
+        slices and only fires for the (usually small number of) cross-base
+        chunks."""
+        if self._disable_opt1:
+            return self._refill_legacy()
         N = sum(self.microbatch_sizes)
-        num_equal_batches = N // self.equal_mb_size
+        k = self.equal_mb_size
+        num_equal_batches = N // k
 
-        # Accumulate equal-sized batches
         batches = []
         for _ in range(num_equal_batches):
             batch = next(self.base_iterator)
@@ -148,7 +268,45 @@ class DynamicMicrobatchIterator:
                 return
             batches.append(batch)
 
-        # Concatenate along the batch dimension (dim=0), then split by microbatch_sizes
+        self._chunks = {}
+        cumsum = 0
+        for mb_id, size in enumerate(self.microbatch_sizes):
+            start = cumsum
+            end = cumsum + size
+            cumsum = end
+            first_base = start // k
+            last_base = (end - 1) // k
+            if first_base == last_base:
+                base_start = start - first_base * k
+                base_end = end - first_base * k
+                base_batch = batches[first_base]
+                if base_start == 0 and base_end == k:
+                    self._chunks[mb_id] = base_batch
+                else:
+                    self._chunks[mb_id] = _slice_batch(base_batch, base_start, base_end)
+            else:
+                pieces = []
+                for bi in range(first_base, last_base + 1):
+                    bs = max(start - bi * k, 0)
+                    be = min(end - bi * k, k)
+                    pieces.append(_slice_batch(batches[bi], bs, be))
+                self._chunks[mb_id] = _concat_batches(pieces)
+
+        self._filled = True
+
+    def _refill_legacy(self):
+        """Original concat-then-split refill, kept behind CDC_DISABLE_OPT1=1
+        so the new path can be A/B-tested for correctness."""
+        N = sum(self.microbatch_sizes)
+        num_equal_batches = N // self.equal_mb_size
+        batches = []
+        for _ in range(num_equal_batches):
+            batch = next(self.base_iterator)
+            if batch is None:
+                self._chunks = {i: None for i in range(len(self.microbatch_sizes))}
+                self._filled = True
+                return
+            batches.append(batch)
         if isinstance(batches[0], dict):
             full_batch = {}
             for key in batches[0]:
@@ -161,10 +319,11 @@ class DynamicMicrobatchIterator:
                 chunk = {}
                 for key in full_batch:
                     if full_batch[key] is not None:
-                        chunk[key], full_batch[key] = (
+                        piece, full_batch[key] = (
                             full_batch[key][:mb_size],
                             full_batch[key][mb_size:],
                         )
+                        chunk[key] = piece
                     else:
                         chunk[key] = None
                 self._chunks[mb_id] = chunk
@@ -178,8 +337,9 @@ class DynamicMicrobatchIterator:
                 chunk = []
                 for i in range(len(full)):
                     if full[i] is not None:
-                        chunk.append(full[i][:mb_size])
+                        piece = full[i][:mb_size]
                         full[i] = full[i][mb_size:]
+                        chunk.append(piece)
                     else:
                         chunk.append(None)
                 self._chunks[mb_id] = type(batches[0])(chunk)
@@ -187,12 +347,26 @@ class DynamicMicrobatchIterator:
             full = torch.cat(batches, dim=0)
             splits = torch.split(full, self.microbatch_sizes, dim=0)
             self._chunks = {i: s for i, s in enumerate(splits)}
-
         self._filled = True
 
     def __next__(self):
-        if not self._filled:
-            self._refill()
+        if self._disable_opt2:
+            # Legacy path: do upfront refill on first __next__.
+            if not self._filled:
+                self._refill()
+            if self._next_mb_id is None:
+                raise RuntimeError(
+                    "DynamicMicrobatchIterator: next() called without set_next_mb_id(). "
+                    "This means data is being consumed outside of schedule_compute_task."
+                )
+            mb_id = self._next_mb_id
+            self._next_mb_id = None
+            return self._chunks[mb_id]
+
+        # Opt 2: lazy per-call pull. We only consume base batches up to the
+        # last_base required by this microbatch, then materialize the chunk
+        # from the cached bases. This spreads DataLoader-worker pressure
+        # across the iteration so the prefetch queue can keep up.
         if self._next_mb_id is None:
             raise RuntimeError(
                 "DynamicMicrobatchIterator: next() called without set_next_mb_id(). "
@@ -200,7 +374,27 @@ class DynamicMicrobatchIterator:
             )
         mb_id = self._next_mb_id
         self._next_mb_id = None
-        return self._chunks[mb_id]
+        first_base, last_base, base_start, base_end, whole_first = self._chunk_specs[mb_id]
+        self._ensure_base_pulled(last_base)
+        if self._non_data_stage:
+            return None
+        if whole_first:
+            return self._base_cache[first_base]
+        if first_base == last_base:
+            return _slice_batch(self._base_cache[first_base], base_start, base_end)
+        # Multi-base chunk: collect slices and concat.
+        pieces = []
+        for bi in range(first_base, last_base + 1):
+            if bi == first_base:
+                bs = base_start
+            else:
+                bs = 0
+            if bi == last_base:
+                be = base_end
+            else:
+                be = self.equal_mb_size
+            pieces.append(_slice_batch(self._base_cache[bi], bs, be))
+        return _concat_batches(pieces)
 
     def __iter__(self):
         return self
@@ -209,18 +403,33 @@ class DynamicMicrobatchIterator:
         """Reset state for the next training iteration (re-fill from data iterator)."""
         self._chunks = {}
         self._filled = False
+        self._base_cache = []
+        self._non_data_stage = False
 
 
 def get_or_set_pp_io_tensor(tensor_dict: Dict, key, config, tensor_shape):
-    return tensor_dict.setdefault(
-        key,
-        torch.empty(
+    """Return cached buffer for key, allocating only on miss.
+
+    Optimization 2 (see tmp_sganter/docs/dispatcher_optimizations.md):
+    dict.setdefault always evaluates its default expression, so the
+    previous implementation allocated a throwaway torch.empty on every
+    call even when the cache already had the entry. Switch to an
+    explicit miss-check so the allocation only happens when needed.
+
+    Note: pp_scheduler clears entries to None after use (see input_tensors
+    cleanup around line 1855). For a None-valued entry, we treat it as a
+    miss and re-allocate, matching the original semantics.
+    """
+    val = tensor_dict.get(key)
+    if val is None:
+        val = torch.empty(
             tensor_shape,
             requires_grad=True,
             device=torch.cuda.current_device(),
             dtype=config.pipeline_dtype,
-        ),
-    )
+        )
+        tensor_dict[key] = val
+    return val
 
 
 class CDCDynamicScheduleGenerator:
@@ -694,6 +903,11 @@ class CDCDynamicScheduleGenerator:
                     num_chunks=num_chunks,
                 )
 
+                # Default cost model: single-point scaling
+                #   comp[d][op] = T_op[d] / f_profiled       (per-sample slope)
+                #   compBias    = 0.0                        (no fixed overhead)
+                #   comm[dir]   = avg(T_bw) / f_profiled     (per-sample slope)
+                #   commLat     = T_alpha[src][dst]          (per-edge intercept)
                 comp = [
                     [
                         float(self.T_F_list[0][d]) / f_profiled,
@@ -702,7 +916,7 @@ class CDCDynamicScheduleGenerator:
                     ]
                     for d in range(self.pp_size)
                 ]
-                compBias = 0.0
+                compBias = [[0.0, 0.0, 0.0] for _ in range(self.pp_size)]
 
                 commLat = T_alpha_with_inject.tolist()
                 if self.pp_size > 1:
@@ -712,19 +926,27 @@ class CDCDynamicScheduleGenerator:
                 else:
                     comm = [0.0, 0.0]
 
-                # Scale to integers for the MILP solver
-                all_vals = []
-                for row in comp:
-                    all_vals.extend(row)
-                all_vals.append(compBias)
-                all_vals.extend(comm)
-                for row in commLat:
-                    all_vals.extend(row)
-                nonzero = [abs(v) for v in all_vals if abs(v) > 1e-15]
-                scale = 10.0 / min(nonzero) if nonzero else 1.0
+                # Affine cost model overlay: when --cdc_profile_affine produced
+                # fits, replace per-(dev, op) compute slopes + intercepts with
+                # the regression results, and average comm slopes from the
+                # per-edge fits. First-stage compute (and any cell missing a
+                # fit) keeps the single-point fallback above.
+                if getattr(self.args, "cdc_profile_affine", False):
+                    self._apply_affine_overlays(comp, compBias, comm, commLat, f_profiled=f_profiled)
+
+                # Floor very-small intercepts so the integer scaling below
+                # doesn't blow up. Anything < 2% of slope*max_in_grid is
+                # numerical noise from the regression on a near-perfectly-
+                # linear cell — see issue (i) in the design doc.
+                _floor_small_intercepts(compBias, comp, N)
+
+                # Integer scaling for the MILP. We use a fixed scale (sec ->
+                # microseconds) instead of ``10/min(nonzero)`` so adding new
+                # bias terms can't blow up the LP coefficient range.
+                scale = 1e6
 
                 comp_scaled = [[v * scale for v in row] for row in comp]
-                compBias_scaled = compBias * scale
+                compBias_scaled = [[v * scale for v in row] for row in compBias]
                 comm_scaled = [v * scale for v in comm]
                 commLat_scaled = [[v * scale for v in row] for row in commLat]
 
@@ -762,7 +984,79 @@ class CDCDynamicScheduleGenerator:
                         commLat=commLat_scaled,
                     )
                     g.build_ilp()
-                    g.solve_ilp(verbose=True, time_limit=120, relative_gap=0.01)
+                    # Bound the LP search space with a generous cap and a
+                    # shape-diversity penalty.
+                    #
+                    # The cap (max f_i ≤ 2·uniform_size) keeps the MILP
+                    # variable space manageable; the runtime cost shaping
+                    # is done by the penalty term below.
+                    #
+                    # The penalty models the unmodeled per-distinct-shape
+                    # runtime overhead: cuBLAS kernel-selection lookups
+                    # the first time each shape is launched, NCCL stream
+                    # multiplexing of variable-size sends, and the Python
+                    # dispatcher's per-shape codepaths. Without this term
+                    # the LP picked extreme bimodal [1,…,1,BIG] schedules
+                    # that look cheap in the cost model but were 5–10 %
+                    # slower at runtime. With the penalty, the LP can
+                    # still pick a genuinely dynamic schedule when it
+                    # saves enough makespan to justify each extra shape,
+                    # and falls back to closer-to-uniform schedules when
+                    # the comm bottleneck (high injected latency) leaves
+                    # nothing for dynamic sizing to exploit.
+                    uniform_size = N // self.num_microbatch
+                    # Cap at uniform_size + 2 by default: gives the LP room
+                    # to play (sizes ∈ {1, ..., 6} at gbs=64, num_mb=16) while
+                    # preventing the >1.5×-uniform jumps that hurt runtime.
+                    # An explicit non-zero --cdc_dynamic_mb_max_f_cap overrides
+                    # the default — set it to N to disable the cap entirely
+                    # for investigation runs.
+                    arg_cap = int(getattr(self.args,
+                                          "cdc_dynamic_mb_max_f_cap", 0) or 0)
+                    if arg_cap > 0:
+                        max_f_per_mb = arg_cap
+                    else:
+                        max_f_per_mb = max(2, uniform_size + 2)
+                    if uniform_size >= 1:
+                        for fv in g.prob_f:
+                            fv.upBound = min(int(fv.upBound), max_f_per_mb)
+
+                    if pulp is not None:
+                        # Per-distinct-shape penalty in *scaled* (us) units —
+                        # ~0.3 ms per extra microbatch shape is enough to
+                        # break ties cleanly without preventing the LP from
+                        # exploring varied schedules when they pay off.
+                        shape_penalty_us = float(
+                            getattr(self.args,
+                                    "cdc_dynamic_mb_shape_penalty_us",
+                                    500.0)
+                        )
+                        shapes_range = list(range(1, max_f_per_mb + 1))
+                        y_s = {
+                            s: pulp.LpVariable(
+                                f"shape_used_{s}", 0, 1, cat="Binary"
+                            )
+                            for s in shapes_range
+                        }
+                        for i in range(self.num_microbatch):
+                            z_vars = [
+                                pulp.LpVariable(
+                                    f"shape_pick_{i}_{s}", 0, 1, cat="Binary"
+                                )
+                                for s in shapes_range
+                            ]
+                            # exactly one shape per microbatch
+                            g.prob += pulp.lpSum(z_vars) == 1
+                            # f_i = sum_s s * z_{i,s}
+                            g.prob += g.prob_f[i] == pulp.lpSum(
+                                s * z_vars[k] for k, s in enumerate(shapes_range)
+                            )
+                            for k, s in enumerate(shapes_range):
+                                g.prob += y_s[s] >= z_vars[k]
+                        g.prob.objective += shape_penalty_us * pulp.lpSum(
+                            y_s[s] for s in shapes_range
+                        )
+                    g.solve_ilp(verbose=True, time_limit=600, relative_gap=0.01)
 
                     mb_sizes = g.get_microbatch_sizes()
                     schedule_blocks = g.get_schedule()
@@ -770,12 +1064,95 @@ class CDCDynamicScheduleGenerator:
                     if schedule_blocks is None or mb_sizes is None:
                         raise RuntimeError("[dynamic_mb] MILP solver failed to find a solution")
 
-                    estimated_runtime_raw = g.get_objective_value() / scale if g.get_objective_value() else 0
+                    chosen_obj = g.get_objective_value()
+                    estimated_runtime_raw = chosen_obj / scale if chosen_obj else 0
+
+                    # Safety net: re-solve the LP with f[mb] forced to uniform
+                    # N/num_microbatch. If the uniform-mb schedule has lower
+                    # predicted makespan in the SAME cost model, the MILP
+                    # picked something pathological (typically a side effect
+                    # of the time limit on a flat cost surface). Fall back
+                    # to uniform to "first do no harm".
+                    if (
+                        chosen_obj is not None
+                        and uniform_size >= 1
+                        and uniform_size * self.num_microbatch == N
+                    ):
+                        g_u = UnidirectionalDynamicBatchSizeZBDependencyGraph(
+                            system_cfg=dummy_sys_cfg,
+                            N=N,
+                            comp=comp_scaled,
+                            compBias=compBias_scaled,
+                            comm=comm_scaled,
+                            commLat=commLat_scaled,
+                        )
+                        g_u.build_ilp()
+                        for fv in g_u.prob_f:
+                            fv.lowBound = uniform_size
+                            fv.upBound = uniform_size
+                        g_u.solve_ilp(verbose=False, time_limit=180,
+                                      relative_gap=0.01)
+                        uniform_obj = g_u.get_objective_value()
+                        u_blocks = g_u.get_schedule()
+                        u_sizes = g_u.get_microbatch_sizes()
+                        # Safety net with latency-dependent tolerance.
+                        # At low / mid injected latency the LP's shape
+                        # penalty is enough — only fall back if uniform
+                        # is strictly better in the LP. At very high
+                        # latency (≥ 50 ms) the comm bottleneck means
+                        # any sized variation costs more at runtime than
+                        # the LP can see, so use a tolerant comparison
+                        # to push toward the ZBH1-ordered uniform
+                        # schedule when uniform is even close.
+                        inj_lat_ms = float(getattr(
+                            self.args, "cdc_stock_inject_latency_ms", 0.0))
+                        tol = 0.0  # safety net disabled — always use LP-chosen schedule
+                        if (
+                            uniform_obj is not None
+                            and u_blocks is not None
+                            and u_sizes is not None
+                            and uniform_obj < chosen_obj * tol
+                        ):
+                            print(
+                                f"[dynamic_mb][safety] uniform schedule wins in LP cost model "
+                                f"(uniform={uniform_obj/scale*1e3:.2f}ms < "
+                                f"chosen={chosen_obj/scale*1e3:.2f}ms). "
+                                f"Falling back to uniform mb sizes + ZBH1 ordering."
+                            )
+                            # Use uniform mb sizes BUT with the standard
+                            # ZBH1 task ordering instead of the LP's own
+                            # ordering. At high injected latency the LP's
+                            # ordering, even with uniform sizes, can
+                            # serialize sends in ways the cost model
+                            # doesn't penalise but the NCCL runtime does.
+                            # The known-good ZBH1 ordering avoids that.
+                            from megatron.core.pipeline_parallel.cdc_scheduler.pp_generator.pipeline import (
+                                ZBH1Pipeline,
+                            )
+                            zbh1_fb = ZBH1Pipeline(dummy_sys_cfg)
+                            zbh1_fb.schedule()
+                            schedule_dicts = zbh1_fb.store_schedule_to_dict()
+                            mb_sizes = u_sizes
+                            schedule_blocks = None  # signal "use schedule_dicts directly"
+                            estimated_runtime_raw = uniform_obj / scale
+                        else:
+                            uniform_ms = (
+                                f"{uniform_obj/scale*1e3:.2f}ms"
+                                if uniform_obj is not None
+                                else "n/a"
+                            )
+                            print(
+                                f"[dynamic_mb][safety] keeping MILP-chosen schedule "
+                                f"(chosen={chosen_obj/scale*1e3:.2f}ms vs "
+                                f"uniform={uniform_ms})"
+                            )
 
                 print(f"[dynamic_mb] Solved microbatch sizes: {mb_sizes} (sum={sum(mb_sizes)})", flush=True)
 
-                # Convert to dict format and save (so non-rank-0 can load it)
-                if debug_mb_sizes is None:
+                # Convert to dict format and save (so non-rank-0 can load it).
+                # When safety net falls back to ZBH1, schedule_dicts is already
+                # populated and schedule_blocks is None; skip the conversion.
+                if debug_mb_sizes is None and schedule_blocks is not None:
                     schedule_dicts = [[] for _ in range(self.pp_size)]
                     for dev_blocks in schedule_blocks:
                         for b in dev_blocks:
@@ -798,6 +1175,12 @@ class CDCDynamicScheduleGenerator:
                 saved = json.load(f)
             schedule_dicts = saved["schedule"]
             self.microbatch_sizes = saved["microbatch_sizes"]
+            # Win 2: keep dyn_loss_scale cache consistent with microbatch_sizes.
+            if self.microbatch_sizes is not None:
+                _N = sum(self.microbatch_sizes)
+                self._dyn_loss_scales = [s / _N for s in self.microbatch_sizes]
+            else:
+                self._dyn_loss_scales = None
 
             # Validate the loaded schedule matches the current configuration.
             assert len(schedule_dicts) == self.pp_size, (
@@ -852,10 +1235,243 @@ class CDCDynamicScheduleGenerator:
         estimated_runtime = self.generate_schedule_from_profile()
         return self.pipeline, estimated_runtime
 
+    def _apply_affine_overlays(self, comp, compBias, comm, commLat, f_profiled=None):
+        """Overlay affine-fit slopes/intercepts onto the single-point cost
+        arrays in place. Called only when --cdc_profile_affine was active.
+
+        Compute: for each (chunk, dev) with a fit, replace
+            comp[dev][F|B|W]    <- fit.slope
+            compBias[dev][F|B|W] <- fit.intercept
+        Cells whose fit has ``R² < args.cdc_profile_affine_r2_threshold``
+        are **rejected** and keep the single-point fallback already
+        populated by the caller. This catches the case where compute is
+        launch-overhead-bound at small model sizes and the regression is
+        fitting noise rather than signal — applying such a fit would
+        give the LP a misleading cost surface.
+
+        Comm: average the per-edge fwd/bwd slopes into ``comm[0/1]``
+        (R²-gated per edge), and overwrite ``commLat[src][dst]`` with
+        the per-edge intercepts.
+
+        If ``f_profiled`` is provided we also run a sanity check: at the
+        profile-iter microbatch size, the affine prediction should be
+        close to the canonical ``T_op[d]`` measurement. Disagreements
+        above ``args.cdc_profile_affine_sanity_tol`` trigger a warning
+        log line but do not change behaviour — the R² threshold is the
+        actual gate."""
+        r2_threshold = float(getattr(self.args, "cdc_profile_affine_r2_threshold", 0.7))
+        sanity_tol = float(getattr(self.args, "cdc_profile_affine_sanity_tol", 0.20))
+
+        compute_fits = affine_profiler.load_affine_compute(
+            self.profile_result_path, self.pp_size
+        )
+        comm_fits = affine_profiler.load_affine_comm(self.profile_result_path)
+
+        op_idx = {"F": 0, "B": 1, "W": 2}
+        applied = 0
+        rejected_lowr2 = 0
+        sanity_warnings = 0
+        T_op_lists = {"F": self.T_F_list, "B": self.T_B_list, "W": self.T_W_list}
+        if compute_fits is not None:
+            for (chunk_id, dev), per_op in compute_fits.items():
+                if chunk_id != 0:
+                    # dynamic_mb only solves with num_chunks=1.
+                    continue
+                for op in ("F", "B", "W"):
+                    cell = per_op.get(op) if isinstance(per_op, dict) else None
+                    if not cell:
+                        continue
+                    fit = cell.get("fit") or {}
+                    slope = float(fit.get("slope", 0.0))
+                    intercept = float(fit.get("intercept", 0.0))
+                    r2 = fit.get("r2")
+                    n_points = int(fit.get("n_points", 0))
+                    # Reject low-confidence fits: a flat curve produces tiny
+                    # slope + large intercept that the LP would interpret as
+                    # "this task has a big fixed cost per dispatch", which
+                    # skews schedules toward concentration. Better to keep
+                    # the canonical single-point estimate in those cases.
+                    if n_points >= 2 and r2 is not None and float(r2) < r2_threshold:
+                        rejected_lowr2 += 1
+                        # At low R² the compute is launch-overhead-bound and
+                        # the slope is meaningless — BUT the intercept is
+                        # essentially the floor measurement, which is real.
+                        # If we leave compBias=0 and keep the single-point
+                        # slope (T_op/f_profiled), the LP sees "compute is
+                        # purely linear from zero", which dramatically
+                        # underestimates the cost of small microbatches and
+                        # makes the MILP pick tiny mbs that are actually
+                        # expensive at runtime. Fix: keep the intercept as
+                        # compBias and derive a slope so the model passes
+                        # through the canonical T_op at f_profiled.
+                        used_intercept = False
+                        if intercept > 0.0 and f_profiled is not None and f_profiled > 0:
+                            try:
+                                canonical_T = float(T_op_lists[op][0][dev])
+                                if canonical_T > intercept:
+                                    derived_slope = (canonical_T - intercept) / f_profiled
+                                    comp[dev][op_idx[op]] = derived_slope
+                                    compBias[dev][op_idx[op]] = intercept
+                                    used_intercept = True
+                            except (IndexError, ValueError, TypeError):
+                                pass
+                        print(
+                            f"[dynamic_mb][affine] reject fit dev={dev} op={op}: "
+                            f"R²={float(r2):.3f} < threshold={r2_threshold:.2f} "
+                            f"(used affine intercept={intercept*1e3:.2f}ms as fixed cost)"
+                            if used_intercept
+                            else f"[dynamic_mb][affine] reject fit dev={dev} op={op}: "
+                                 f"R²={float(r2):.3f} < threshold={r2_threshold:.2f} "
+                                 f"(keeping single-point fallback)"
+                        )
+                        continue
+                    if slope > 0.0:
+                        comp[dev][op_idx[op]] = slope
+                    if intercept > 0.0:
+                        compBias[dev][op_idx[op]] = intercept
+                    applied += 1
+
+                    # Sanity check: the affine prediction at the profile-iter
+                    # mbs should be close to the canonical T_op measurement.
+                    if f_profiled is not None and f_profiled > 0:
+                        try:
+                            predicted = slope * f_profiled + intercept
+                            canonical = float(T_op_lists[op][0][dev])
+                            if canonical > 0:
+                                rel_err = abs(predicted - canonical) / canonical
+                                if rel_err > sanity_tol:
+                                    sanity_warnings += 1
+                                    print(
+                                        f"[dynamic_mb][affine] sanity check dev={dev} op={op}: "
+                                        f"affine predicts {predicted*1e6:.0f}us at mbs={f_profiled}, "
+                                        f"canonical T_op was {canonical*1e6:.0f}us "
+                                        f"(rel_err={rel_err*100:.1f}% > tol={sanity_tol*100:.0f}%)"
+                                    )
+                        except (IndexError, ValueError, TypeError):
+                            pass
+            print(
+                f"[dynamic_mb][affine] compute fits: applied={applied}, "
+                f"rejected_lowr2={rejected_lowr2}, sanity_warnings={sanity_warnings} "
+                f"(threshold R²={r2_threshold:.2f})"
+            )
+        else:
+            print(
+                "[dynamic_mb][affine] flag set but no affine_profile_rank*.json found; "
+                "compute keeps single-point scaling"
+            )
+
+        if comm_fits is not None and self.pp_size > 1:
+            fwd_slopes: List[float] = []
+            bwd_slopes: List[float] = []
+            comm_rejected = 0
+            for edge_str, payload in comm_fits.get("fwd_per_edge", {}).items():
+                src = int(edge_str)
+                dst = src + 1
+                fit = payload.get("fit") or {}
+                r2 = fit.get("r2")
+                n_points = int(fit.get("n_points", 0))
+                if n_points >= 2 and r2 is not None and float(r2) < r2_threshold:
+                    comm_rejected += 1
+                    print(
+                        f"[dynamic_mb][affine] reject comm fwd edge {src}->{dst}: "
+                        f"R²={float(r2):.3f} < threshold={r2_threshold:.2f}"
+                    )
+                    continue
+                if fit.get("slope") is not None:
+                    fwd_slopes.append(float(fit["slope"]))
+                if fit.get("intercept") is not None and float(fit["intercept"]) > 0:
+                    commLat[src][dst] = float(fit["intercept"])
+            for edge_str, payload in comm_fits.get("bwd_per_edge", {}).items():
+                src = int(edge_str)
+                dst = src + 1
+                fit = payload.get("fit") or {}
+                r2 = fit.get("r2")
+                n_points = int(fit.get("n_points", 0))
+                if n_points >= 2 and r2 is not None and float(r2) < r2_threshold:
+                    comm_rejected += 1
+                    print(
+                        f"[dynamic_mb][affine] reject comm bwd edge {dst}->{src}: "
+                        f"R²={float(r2):.3f} < threshold={r2_threshold:.2f}"
+                    )
+                    continue
+                if fit.get("slope") is not None:
+                    bwd_slopes.append(float(fit["slope"]))
+                if fit.get("intercept") is not None and float(fit["intercept"]) > 0:
+                    commLat[dst][src] = float(fit["intercept"])
+            if fwd_slopes:
+                comm[0] = float(np.mean(fwd_slopes))
+            if bwd_slopes:
+                comm[1] = float(np.mean(bwd_slopes))
+            print(
+                f"[dynamic_mb][affine] applied comm fits for "
+                f"{len(fwd_slopes)} fwd / {len(bwd_slopes)} bwd edges "
+                f"(rejected_lowr2={comm_rejected})"
+            )
+        else:
+            print(
+                "[dynamic_mb][affine] flag set but no affine_profile_comm.json found; "
+                "comm keeps single-point scaling"
+            )
+
     def update_latency_bandwidth_seconds(
         self, latency_seconds=None, bandwidth_seconds=None
     ):
         self.override_T_comm(latency_seconds, bandwidth_seconds)
+
+    def apply_stock_inject_latency(self, latency_seconds: float, link_mode: str) -> None:
+        """Add the artificial latency injected by `--cdc_stock_inject_latency_ms`
+        into ``self.injected_latency`` so the MILP sees it as part of T_alpha.
+
+        Mirrors the boundary logic used at runtime by
+        ``CDCPPScheduler._isend_with_optional_stock_spin`` so the LP cost
+        model agrees with what actually happens during training.
+
+        Unlike ``override_T_comm`` (which uses ``self.args.num_dc`` and
+        therefore requires --num_dc>1 to inject anything), this works
+        without --num_dc / --pp_stages_per_dc by defaulting to a 2-DC
+        split in half. The mode mirrors the runtime flag:
+          - "all": every adjacent edge gets the latency
+          - "cross_boundary": only the link crossing the (synthetic or
+            user-set) DC boundary
+          - "none": no injection
+        """
+        if latency_seconds <= 0 or link_mode == "none":
+            return
+        if not self.initialized:
+            return
+        # Boundary identification — same logic as the runtime injection.
+        if link_mode == "all":
+            boundary_edges = [(i, i + 1) for i in range(self.pp_size - 1)]
+        elif link_mode == "cross_boundary":
+            if self.pp_size <= 1:
+                return
+            n_dc = max(1, int(getattr(self.args, "num_dc", 1)))
+            stages_per_dc = process_pp_stages_per_dc(
+                getattr(self.args, "pp_stages_per_dc", []),
+                self.pp_size,
+                n_dc if n_dc > 1 else 2,
+            )
+            boundaries = [sum(stages_per_dc[:i]) for i in range(1, len(stages_per_dc) + 1)]
+            boundary_edges = []
+            for b in boundaries:
+                if 1 <= b < self.pp_size:  # skip wrap-around
+                    boundary_edges.append((b - 1, b))
+        else:
+            return
+        for src, dst in boundary_edges:
+            # `injected_latency` is added to `T_alpha_matrix` later; here we
+            # ensure it reflects the runtime delay. Use max(0, ...) in case
+            # the profiled NVLink time is already higher (rare).
+            self.injected_latency[src, dst] = max(
+                self.injected_latency[src, dst],
+                latency_seconds - self.T_alpha_matrix[src, dst],
+                0.0,
+            )
+            self.injected_latency[dst, src] = max(
+                self.injected_latency[dst, src],
+                latency_seconds - self.T_alpha_matrix[dst, src],
+                0.0,
+            )
 
 
 class CDCPPScheduler:
@@ -872,7 +1488,7 @@ class CDCPPScheduler:
         self.use_static_schedule = False
         self.use_dynamic_schedule = False
         self.pp_schedule: Pipeline = None
-        
+
         self.num_subparts = args.num_subparts
         if self.num_subparts > 1:
             assert args.dynamic_schedule == "subud"
@@ -1016,6 +1632,11 @@ class CDCPPScheduler:
 
         self.exp_manager.cdc_comm_profiles = self.pp_benchmark()
 
+        # One-shot guard for the affine profiler. The actual sweep runs from
+        # forward_backward_func once the model + iterator are live and right
+        # before the dynamic_mb LP solves, so that the LP can pick up the fits.
+        self._affine_profile_done = False
+
         self.wgrad_split = any(
             [task.task_desc.type == "W" for task in self.pp_execution_plan_cur_device]
         )
@@ -1039,58 +1660,129 @@ class CDCPPScheduler:
 
         # dynamic microbatch sizes (None = all equal, set after solver runs)
         self.microbatch_sizes: Optional[List[int]] = None
+        # Win 2 cache (recomputed when microbatch_sizes is assigned).
+        self._dyn_loss_scales: Optional[List[float]] = None
+        # Win 4 cache (per-mb tensor_shape; recomputed once per call to
+        # forward_backward_func when microbatch_sizes is set).
+        self._cached_tensor_shapes: Optional[List[List[int]]] = None
+        # Win 3: cached "data iterator was wrapped this iter" flag, set in
+        # forward_backward_func once per iter so per-task hot loop doesn't
+        # need a per-task isinstance() check.
+        self._data_iter_is_dynamic: bool = False
 
-        # Create dedicated 2-rank P2P groups for dynamic_mb.
-        # The default extra groups are 4-rank groups (all PP ranks).  Unbatched
-        # isend/irecv on 4-rank groups causes lazy sub-communicator creation that
-        # deadlocks when ranks issue P2P to different partners concurrently.
-        # 2-rank groups avoid this entirely.
-        self._p2p_send_next_group = None
-        self._p2p_recv_next_group = None
-        self._p2p_send_prev_group = None
-        self._p2p_recv_prev_group = None
-        # Flag shared by all ranks so the warmup and schedule_comm_event can
-        # route consistently. Checking an individual group handle is wrong:
-        # the first/last rank legitimately lacks prev/next handles even when
-        # dedicated groups are in use, and mixing dedicated + extra groups
-        # across a send/recv pair causes a communicator mismatch.
-        self._use_dedicated_p2p_groups = False
-        # Only create dedicated 2-rank groups when pp_size > 2.  With pp_size==2
-        # the default extra groups are already effectively 2-rank and work fine.
-        pp_world_size = parallel_state.get_pipeline_model_parallel_world_size()
-        if self.use_dynamic_schedule and pp_world_size > 2:
-            self._use_dedicated_p2p_groups = True
-            pp_ranks = parallel_state._PIPELINE_GLOBAL_RANKS
-            if not isinstance(pp_ranks[0], list):
-                pp_ranks = [pp_ranks]
-            for ranks in pp_ranks:
-                if dist.get_rank() in ranks:
-                    pp_rank_in_group = ranks.index(dist.get_rank())
-                    pp_size_in_group = len(ranks)
-                    next_idx = (pp_rank_in_group + 1) % pp_size_in_group
-                    prev_idx = (pp_rank_in_group - 1 + pp_size_in_group) % pp_size_in_group
-                    next_global = ranks[next_idx]
-                    prev_global = ranks[prev_idx]
-                    my_global = dist.get_rank()
-                    # Create 2-rank groups for each adjacent pair (skip wrap-around)
-                    for i in range(pp_size_in_group - 1):
-                        j = i + 1
-                        pair = [ranks[i], ranks[j]]
-                        g = dist.new_group(pair)
-                        if my_global == ranks[i] and next_global == ranks[j]:
-                            self._p2p_send_next_group = g
-                        if my_global == ranks[j] and prev_global == ranks[i]:
-                            self._p2p_recv_prev_group = g
-                        # Backward direction: j sends to i
-                        g2 = dist.new_group(pair)
-                        if my_global == ranks[j] and prev_global == ranks[i]:
-                            self._p2p_send_prev_group = g2
-                        if my_global == ranks[i] and next_global == ranks[j]:
-                            self._p2p_recv_next_group = g2
+        # NOTE: heteropipe used to create dedicated 2-rank P2P ProcessGroups
+        # here when use_dynamic_schedule and pp_size > 2, as a workaround for
+        # the 4-GPU dangling-recv NCCL hang (see tmp_sganter/docs/root_cause.md).
+        # That workaround was removed once JIT-recv fixed the actual root cause:
+        # dynamic_mb now uses the same `parallel_state.get_pipeline_extra_*_group()`
+        # NCCL communicators as the static (ZBH1, 1F1B, ...) schedules.
+
+        # Optimization 1 (see tmp_sganter/docs/dispatcher_optimizations.md):
+        # cache parallel_state lookups that are constant after init.
+        # schedule_comm_event used to call these on every event (~300 events/iter
+        # = ~1800 cross-module function calls per iteration that all return
+        # constants). Now they're computed once.
+        self._cached_next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
+        self._cached_prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
+        self._cached_extra_send_next_group = parallel_state.get_pipeline_extra_send_next_group()
+        self._cached_extra_recv_next_group = parallel_state.get_pipeline_extra_recv_next_group()
+        self._cached_extra_send_prev_group = parallel_state.get_pipeline_extra_send_prev_group()
+        self._cached_extra_recv_prev_group = parallel_state.get_pipeline_extra_recv_prev_group()
+
+        # Stock-PyTorch artificial latency injection (sender-side `torch.cuda._sleep`).
+        # See tmp_sganter/docs/comm_delay_investigation.md for rationale.
+        # Why sender-side: putting the spin on the receiver's WAIT path adds
+        # latency_ms on TOP of any prior compute, which overcounts and kills
+        # the overlap the MILP modeled. On the sender's send stream, the spin
+        # runs concurrently with default-stream compute, and the receiver sees
+        # the data at the actual link arrival time (max(0, lat - elapsed)).
+        self._stock_inject_lat_ms = float(getattr(args, "cdc_stock_inject_latency_ms", 0.0))
+        self._stock_inject_warmup_iters = int(getattr(args, "cdc_stock_inject_warmup_iters", 10))
+        self._stock_inject_link_mode = str(getattr(args, "cdc_stock_inject_link", "cross_boundary"))
+        self._stock_inject_enabled = (
+            self._stock_inject_lat_ms > 0.0 and self._stock_inject_link_mode != "none"
+        )
+        # Per-direction dedicated CUDA streams for the spin+isend kernels.
+        # Lazily created so non-CUDA paths don't pay for them.
+        self._stock_inject_send_next_stream: Optional[torch.cuda.Stream] = None
+        self._stock_inject_send_prev_stream: Optional[torch.cuda.Stream] = None
+        # cycles_per_ms calibrated once on first use. Hardcoded to a calibrated
+        # H100 NVL value; auto-calibrates on other GPUs in case anyone moves this.
+        self._stock_inject_cycles_per_ms: float = 1_784_909.0
+        self._stock_inject_calibrated: bool = False
+        # Identify which sends should be delayed.
+        # cross_boundary: only the link to the rank in a different DC.
+        # all: every outgoing send.
+        # none: nothing (already gated above).
+        self._stock_inject_delay_next = False
+        self._stock_inject_delay_prev = False
+        if self._stock_inject_enabled:
+            if self._stock_inject_link_mode == "all":
+                self._stock_inject_delay_next = True
+                self._stock_inject_delay_prev = True
+            elif self._stock_inject_link_mode == "cross_boundary":
+                # Reuse the same DC-boundary logic the existing flag uses
+                # (computed below in the num_dc > 1 block). We re-compute it
+                # here independently so the new flag works without --num_dc.
+                # If pp_size == 1, there are no inter-rank links anyway.
+                # NOTE: this runs inside CDCPPScheduler.__init__, where
+                # `self.pp_size` is NOT set yet (only `self.pp_rank` is set
+                # at line 1289). Use the local `pp_size` from the enclosing
+                # scope (derived from args.pipeline_model_parallel_size).
+                if pp_size > 1:
+                    # Default: place the slow link between the last "half" of
+                    # the pipeline and the rest (mirrors --pp_stages_per_dc with
+                    # 2 DCs split in half). User overrides via --num_dc and
+                    # --pp_stages_per_dc if they want a different boundary.
+                    n_dc = max(1, int(getattr(args, "num_dc", 1)))
+                    stages_per_dc = process_pp_stages_per_dc(
+                        getattr(args, "pp_stages_per_dc", []),
+                        pp_size,
+                        n_dc if n_dc > 1 else 2,  # default to 2-DC split if user didn't set
+                    )
+                    boundaries = [sum(stages_per_dc[:i]) for i in range(1, len(stages_per_dc) + 1)]
+                    # pp_rank's send-to-next is at the boundary if (pp_rank + 1) is a boundary.
+                    if (pp_rank + 1) in boundaries:
+                        self._stock_inject_delay_next = True
+                    # pp_rank's send-to-prev is at the boundary if pp_rank is a boundary
+                    # (i.e. it's the first rank in its DC, sending back to the prev DC).
+                    if pp_rank in [b % pp_size for b in boundaries]:
+                        self._stock_inject_delay_prev = True
+        # Iteration counter for warmup skipping. Read from the experiment manager
+        # at injection time so we honor the current training iteration.
+        self.cdc_print(
+            f"stock latency injection: enabled={self._stock_inject_enabled} "
+            f"lat_ms={self._stock_inject_lat_ms} link_mode={self._stock_inject_link_mode} "
+            f"delay_next={self._stock_inject_delay_next} delay_prev={self._stock_inject_delay_prev} "
+            f"warmup_iters={self._stock_inject_warmup_iters}",
+        )
 
         # grad sync
         self.no_sync_func = None
         self.no_sync_context = None
+
+        # Profiling instrumentation (env-var gated):
+        #   CDC_BYPASS_DYNAMIC_ITERATOR=1 — skip DynamicMicrobatchIterator wrap
+        #     and per-task / per-event dynamic-mode branches. Only meaningful
+        #     when microbatch_sizes happens to match micro_batch_size for every
+        #     entry (e.g. --cdc_debug_mb_sizes 4 4 ...). Loss values will match
+        #     the static path under that condition; under variable mbs they
+        #     will not, so do not use this for real training.
+        #   CDC_PROFILE_DISPATCHER=1 — wrap the forward_backward_func body in
+        #     cProfile. Stats are collected between iter
+        #     CDC_PROFILE_WARMUP (default 10) and CDC_PROFILE_LAST (default 110)
+        #     and dumped to CDC_PROFILE_OUT (default
+        #     /tmp/cdc_profile_rank<R>.prof) on the last enabled iter.
+        self._bypass_dynamic_iterator = bool(int(os.environ.get("CDC_BYPASS_DYNAMIC_ITERATOR", "0")))
+        self._profile_dispatcher = bool(int(os.environ.get("CDC_PROFILE_DISPATCHER", "0")))
+        self._profile_warmup = int(os.environ.get("CDC_PROFILE_WARMUP", "10"))
+        self._profile_last = int(os.environ.get("CDC_PROFILE_LAST", "110"))
+        self._profile_out = os.environ.get(
+            "CDC_PROFILE_OUT", f"/tmp/cdc_profile_rank{self.pp_rank}.prof"
+        )
+        self._profile_obj: Optional[cProfile.Profile] = None
+        self._profile_iter_counter = 0
+        self._profile_dumped = False
 
         self.validate_args()
 
@@ -1192,10 +1884,32 @@ class CDCPPScheduler:
             self.pp_schedule_generator.update_latency_bandwidth_seconds(
                 self.injected_latency_delay[1], self.injected_bandwidth_delay[1]
             )
+            # Plumb the stock-PyTorch artificial latency into the LP cost
+            # model. Without this the MILP profiles at iter 2 (fast NVLink),
+            # picks a schedule with many small microbatches that don't
+            # amortize the per-send latency, and loses to ZBH1 at runtime.
+            # See tmp_sganter/logs/injected_latency/RESULTS_pp4.md.
+            if self._stock_inject_enabled:
+                self.pp_schedule_generator.apply_stock_inject_latency(
+                    latency_seconds=self._stock_inject_lat_ms / 1000.0,
+                    link_mode=self._stock_inject_link_mode,
+                )
+                self.cdc_print(
+                    f"stock latency injection: LP T_alpha now includes "
+                    f"{self._stock_inject_lat_ms}ms on "
+                    f"{self._stock_inject_link_mode} edges",
+                    rank=0,
+                )
             self.pp_schedule, estimated_runtime = self.pp_schedule_generator.get_schedule()
             # Propagate dynamic microbatch sizes if available
             if self.pp_schedule_generator.microbatch_sizes is not None:
                 self.microbatch_sizes = self.pp_schedule_generator.microbatch_sizes
+                # Win 2: cache dyn_loss_scale array (one division per mb instead
+                # of recomputing sum(microbatch_sizes) / per-mb division each task).
+                _N = sum(self.microbatch_sizes)
+                self._dyn_loss_scales = [s / _N for s in self.microbatch_sizes]
+            else:
+                self._dyn_loss_scales = None
 
         if (self.use_static_schedule and self.args.enable_prefetch_opt) or self.use_dynamic_schedule:
             self.pp_execution_planner = ExecutionPlanner(self.pp_schedule)
@@ -1227,48 +1941,13 @@ class CDCPPScheduler:
 
         dist.barrier()
 
-        # Pre-initialize the dedicated 2-rank P2P groups.  Each group has exactly
-        # 2 ranks, so we just need matching send/recv on each pair.
-        if self.microbatch_sizes is not None and not hasattr(self, '_pp_group_p2p_initialized'):
-            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-            pp_size = parallel_state.get_pipeline_model_parallel_world_size()
-            next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
-            prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
-            dummy = torch.zeros(1, device=torch.cuda.current_device())
-            # Forward direction: even ranks send first, odd recv first.
-            # Guard on the shared flag, not on a per-rank handle: the last rank
-            # has _p2p_send_next_group = None but must still enter this block
-            # to participate in the internal dist.barrier() calls, otherwise
-            # ranks 0..pp_size-2 deadlock waiting for it.
-            if self._use_dedicated_p2p_groups:
-                if pp_rank % 2 == 0:
-                    if pp_rank < pp_size - 1:
-                        dist.send(dummy, next_rank, group=self._p2p_send_next_group)
-                else:
-                    dist.recv(dummy, prev_rank, group=self._p2p_recv_prev_group)
-                dist.barrier()
-                if pp_rank % 2 == 0:
-                    if pp_rank < pp_size - 1:
-                        dist.recv(dummy, next_rank, group=self._p2p_recv_next_group)
-                else:
-                    dist.send(dummy, prev_rank, group=self._p2p_send_prev_group)
-                dist.barrier()
-                # Backward direction
-                if pp_rank % 2 == 0:
-                    if pp_rank > 0:
-                        dist.recv(dummy, prev_rank, group=self._p2p_recv_prev_group)
-                else:
-                    if pp_rank < pp_size - 1:
-                        dist.send(dummy, next_rank, group=self._p2p_send_next_group)
-                dist.barrier()
-                if pp_rank % 2 == 0:
-                    if pp_rank > 0:
-                        dist.send(dummy, prev_rank, group=self._p2p_send_prev_group)
-                else:
-                    if pp_rank < pp_size - 1:
-                        dist.recv(dummy, next_rank, group=self._p2p_recv_next_group)
-                dist.barrier()
-            self._pp_group_p2p_initialized = True
+        # Note: heteropipe used to do a parity-based 4-phase eager P2P warmup
+        # here to force NCCL to materialize the dedicated 2-rank communicators
+        # before the first real iteration. With the dedicated groups removed
+        # (JIT-recv made them unnecessary, see tmp_sganter/docs/root_cause.md),
+        # the schedule reuses the same `parallel_state.get_pipeline_extra_*_group()`
+        # NCCL communicators that ZBH1/1F1B already use, which are initialized
+        # by Megatron's own setup. No additional warmup needed.
 
         self.exp_manager.exp_logging_perf_model_iter_time[(self.injected_latency_delay, self.injected_bandwidth_delay)] = estimated_runtime
 
@@ -1407,27 +2086,31 @@ class CDCPPScheduler:
             )
 
     def schedule_comm_event(self, event: CommEvent, config, tensor_shape, forward_only=False):
-        next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
-        prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
+        # Optimization 1: read cached values instead of calling parallel_state
+        # lookups every event. These are constant for the lifetime of this
+        # scheduler. See tmp_sganter/docs/dispatcher_optimizations.md.
+        next_rank = self._cached_next_rank
+        prev_rank = self._cached_prev_rank
 
-        # With dynamic microbatch sizes, override tensor_shape using the event's
-        # own mb_id (not the calling compute task's mb_id, since recv events are
-        # posted ahead of time for future microbatches).
-        if self.microbatch_sizes is not None and not forward_only:
-            mb_size = self.microbatch_sizes[event.mb_id]
-            tensor_shape = list(tensor_shape)
-            tensor_shape[1] = mb_size
+        # With dynamic microbatch sizes, the P2P shape is the per-mb size.
+        # The 4-GPU dangling-recv NCCL deadlock with heterogeneous P2P shapes
+        # (see tmp_sganter/8_4gpu_hang_root_cause.md Update 15) is fixed by
+        # the JIT-recv path below: irecv is deferred to WAIT time so no recv
+        # kernel sits dangling on a NCCL stream during cuBLAS first-init's
+        # device-wide sync.
+        # Win 4: per-event tensor_shape override now reads from a per-mb
+        # precomputed list (built once per call to forward_backward_func)
+        # instead of allocating a new list on every event.
+        if self._cached_tensor_shapes is not None and not forward_only:
+            tensor_shape = self._cached_tensor_shapes[event.mb_id]
 
-        if self.microbatch_sizes is not None and not forward_only and self._use_dedicated_p2p_groups:
-            send_next_group = self._p2p_send_next_group
-            recv_next_group = self._p2p_recv_next_group
-            send_prev_group = self._p2p_send_prev_group
-            recv_prev_group = self._p2p_recv_prev_group
-        else:
-            send_next_group = parallel_state.get_pipeline_extra_send_next_group()
-            recv_next_group = parallel_state.get_pipeline_extra_recv_next_group()
-            send_prev_group = parallel_state.get_pipeline_extra_send_prev_group()
-            recv_prev_group = parallel_state.get_pipeline_extra_recv_prev_group()
+        # Optimization 1: cached at init time. Same NCCL groups for static and
+        # dynamic schedules (the heteropipe dedicated 2-rank P2P groups were
+        # removed once JIT-recv made them unnecessary).
+        send_next_group = self._cached_extra_send_next_group
+        recv_next_group = self._cached_extra_recv_next_group
+        send_prev_group = self._cached_extra_send_prev_group
+        recv_prev_group = self._cached_extra_recv_prev_group
 
         assert event.task_type in ["F", "B"]
 
@@ -1469,39 +2152,43 @@ class CDCPPScheduler:
                     )
         elif event.type == CommEventType.POST_SEND_NEXT:
             self.send_next_reqs[(event.mb_id, event.chunk_id, event.task_type)] = (
-                self.isend(
+                self._isend_with_optional_stock_spin(
                     send_buffer,
                     next_rank,
                     group=send_next_group,
+                    direction="next",
                     bandwidth_delay_ms=self.injected_bandwidth_delay[1] * 1000 if self.cdc_send_next else 0,
                 )
             )
         elif event.type == CommEventType.POST_RECV_NEXT:
+            # Defer the irecv until WAIT_RECV_NEXT to avoid dangling recv kernels
+            # on the NCCL stream (which deadlock cuBLAS first-init device-wide
+            # sync — see tmp_sganter/8_4gpu_hang_root_cause.md Update 15).
+            _buf = recv_buffer
+            _grp = recv_next_group
+            _peer = next_rank
+            _bw = self.injected_bandwidth_delay[1] * 1000 if self.cdc_recv_next else 0
             self.recv_next_reqs[(event.mb_id, event.chunk_id, event.task_type)] = (
-                self.irecv(
-                    recv_buffer,
-                    next_rank,
-                    group=recv_next_group,
-                    bandwidth_delay_ms=self.injected_bandwidth_delay[1] * 1000 if self.cdc_recv_next else 0,
-                )
+                lambda: self.irecv(_buf, _peer, group=_grp, bandwidth_delay_ms=_bw)
             )
         elif event.type == CommEventType.POST_SEND_PREV:
             self.send_prev_reqs[(event.mb_id, event.chunk_id, event.task_type)] = (
-                self.isend(
+                self._isend_with_optional_stock_spin(
                     send_buffer,
                     prev_rank,
                     group=send_prev_group,
+                    direction="prev",
                     bandwidth_delay_ms=self.injected_bandwidth_delay[1] * 1000 if self.cdc_send_prev else 0,
                 )
             )
         elif event.type == CommEventType.POST_RECV_PREV:
+            # Same JIT-recv pattern as POST_RECV_NEXT.
+            _buf = recv_buffer
+            _grp = recv_prev_group
+            _peer = prev_rank
+            _bw = self.injected_bandwidth_delay[1] * 1000 if self.cdc_recv_prev else 0
             self.recv_prev_reqs[(event.mb_id, event.chunk_id, event.task_type)] = (
-                self.irecv(
-                    recv_buffer,
-                    prev_rank,
-                    group=recv_prev_group,
-                    bandwidth_delay_ms=self.injected_bandwidth_delay[1] * 1000 if self.cdc_recv_prev else 0,
-                )
+                lambda: self.irecv(_buf, _peer, group=_grp, bandwidth_delay_ms=_bw)
             )
         elif event.type == CommEventType.WAIT_SEND_NEXT:
             handle = self.send_next_reqs[(event.mb_id, event.chunk_id, event.task_type)]
@@ -1510,6 +2197,10 @@ class CDCPPScheduler:
         elif event.type == CommEventType.WAIT_RECV_NEXT:
             handle = self.recv_next_reqs[(event.mb_id, event.chunk_id, event.task_type)]
             assert handle is not None
+            if callable(handle):
+                # JIT-recv mode: materialize the deferred irecv now.
+                handle = handle()
+                self.recv_next_reqs[(event.mb_id, event.chunk_id, event.task_type)] = handle
             if self.cdc_recv_next:
                 assert hasattr(
                     handle, "wait_with_lat_delay_in_ms"
@@ -1527,6 +2218,10 @@ class CDCPPScheduler:
         elif event.type == CommEventType.WAIT_RECV_PREV:
             handle = self.recv_prev_reqs[(event.mb_id, event.chunk_id, event.task_type)]
             assert handle is not None
+            if callable(handle):
+                # JIT-recv mode: materialize the deferred irecv now.
+                handle = handle()
+                self.recv_prev_reqs[(event.mb_id, event.chunk_id, event.task_type)] = handle
             if self.cdc_recv_prev:
                 assert hasattr(
                     handle, "wait_with_lat_delay_in_ms"
@@ -1622,16 +2317,17 @@ class CDCPPScheduler:
             
             with nvtx.range(f"Dev{self.pp_rank} F: {mb_id} chunk: {chunk_id}"):
                 if not self.subblock_scheduling:
-                    # Compute loss_scale for dynamic microbatch weighting
-                    dyn_loss_scale = None
-                    if self.microbatch_sizes is not None:
-                        N = sum(self.microbatch_sizes)
-                        dyn_loss_scale = self.microbatch_sizes[mb_id] / N
+                    # Win 2: read precomputed loss_scale instead of recomputing
+                    # sum(microbatch_sizes) / per-mb division each task.
+                    dyn_loss_scale = (
+                        self._dyn_loss_scales[mb_id]
+                        if self._dyn_loss_scales is not None
+                        else None
+                    )
 
-                    # Tell the dynamic iterator which mb_id to yield next
-                    di = data_iterator[chunk_id]
-                    if isinstance(di, DynamicMicrobatchIterator):
-                        di.set_next_mb_id(mb_id)
+                    # Win 3: cached boolean instead of per-task isinstance().
+                    if self._data_iter_is_dynamic:
+                        data_iterator[chunk_id].set_next_mb_id(mb_id)
 
                     self.output_tensors[(mb_id, chunk_id)], num_tokens = forward_step(
                         forward_step_func=forward_step_func,
@@ -1708,8 +2404,6 @@ class CDCPPScheduler:
                         if not is_last_stage
                         else None
                     )
-                    if self.microbatch_sizes is not None:
-                        print(f"[BW r{self.pp_rank}] BEGIN backward_step mb={mb_id} last_stage={is_last_stage}", flush=True)
                     self.input_tensor_grads[(mb_id, chunk_id)] = backward_step(
                         input_tensor=self.input_tensors[(mb_id, chunk_id)],
                         output_tensor=self.output_tensors[(mb_id, chunk_id)],
@@ -1717,8 +2411,6 @@ class CDCPPScheduler:
                         model_type=get_model_type(model[chunk_id]),
                         config=config,
                     )
-                    if self.microbatch_sizes is not None:
-                        print(f"[BW r{self.pp_rank}] END backward_step mb={mb_id}", flush=True)
                     # release tensors
                     self.input_tensors[(mb_id, chunk_id)] = None
                     self.output_tensors[(mb_id, chunk_id)] = None
@@ -1998,28 +2690,78 @@ class CDCPPScheduler:
                 adjusted_seq_length * max_mb_size * config.hidden_size * dtype_size
             )
 
+        # Affine profiling sweep: runs once, after the canonical profile iter
+        # has populated total.json and before the dynamic_mb LP consumes its
+        # cost data. Gated by --cdc_profile_affine and only meaningful for
+        # the dynamic_mb path.
+        if (
+            getattr(self.args, "cdc_profile_affine", False)
+            and not forward_only
+            and not self._affine_profile_done
+            and self.exp_manager.profiling_done()
+            and self.use_dynamic_schedule
+            and self.dynamic_schedule_type == "dynamic_mb"
+        ):
+            self._run_affine_profile(
+                model=model,
+                config=config,
+                adjusted_seq_length=adjusted_seq_length,
+                micro_batch_size=micro_batch_size,
+            )
+            self._affine_profile_done = True
+
         self.update_schedule_with_latency_bandwidth()
 
         # Wrap data iterators for dynamic microbatch sizes (must happen after
-        # update_schedule_with_latency_bandwidth which may set self.microbatch_sizes)
-        if self.microbatch_sizes is not None and not forward_only:
+        # update_schedule_with_latency_bandwidth which may set self.microbatch_sizes).
+        # Win 3: store boolean flag once so per-task hot loop can skip a per-task
+        # isinstance() check.
+        is_dynamic = self.microbatch_sizes is not None and not forward_only
+        # Profiling escape hatch: when CDC_BYPASS_DYNAMIC_ITERATOR=1, pretend
+        # the schedule is static. Only correct when every entry of
+        # microbatch_sizes equals micro_batch_size.
+        if self._bypass_dynamic_iterator:
+            is_dynamic = False
+        self._data_iter_is_dynamic = is_dynamic
+        if is_dynamic:
             data_iterator = [
                 DynamicMicrobatchIterator(di, self.microbatch_sizes, micro_batch_size)
                 for di in data_iterator
             ]
+            # Win 4: build the per-mb tensor_shape cache once per iter.
+            # schedule_comm_event will read directly from this list per event,
+            # avoiding ~300 list() allocations + per-event index lookups.
+            self._cached_tensor_shapes = [
+                [adjusted_seq_length, s, config.hidden_size]
+                for s in self.microbatch_sizes
+            ]
+            # Per-task placeholder shape (max-size buffer that fits any mb).
+            cur_tensor_shape_template = [adjusted_seq_length, max(self.microbatch_sizes), config.hidden_size]
+        else:
+            self._cached_tensor_shapes = None
+            cur_tensor_shape_template = None
+
+        # cProfile instrumentation around the dispatcher (env-var gated).
+        profile_this_iter = (
+            self._profile_dispatcher
+            and not forward_only
+            and not self._profile_dumped
+            and self._profile_iter_counter >= self._profile_warmup
+            and self._profile_iter_counter < self._profile_last
+        )
+        if profile_this_iter:
+            if self._profile_obj is None:
+                self._profile_obj = cProfile.Profile()
+            self._profile_obj.enable()
 
         for idx, compute_task in enumerate(self.pp_execution_plan_cur_device):
             # self.cdc_print(f"compute_task: {compute_task}")
             self.exp_manager.exp_logging_first_mb = True if idx == 0 else False
 
-            # Determine tensor_shape for this microbatch
-            # During eval (forward_only), data uses equal micro_batch_size — skip dynamic shapes.
-            if self.microbatch_sizes is not None and not forward_only:
-                mb_id = compute_task.task_desc.mb_id
-                mb_size = self.microbatch_sizes[mb_id]
-                cur_tensor_shape = [adjusted_seq_length, mb_size, config.hidden_size]
-            else:
-                cur_tensor_shape = tensor_shape
+            # tensor_shape: with variable mb sizes, schedule_comm_event overrides
+            # tensor_shape[1] per-event from self._cached_tensor_shapes. The base
+            # shape here is only used as a fallback for forward-only / static.
+            cur_tensor_shape = cur_tensor_shape_template if is_dynamic else tensor_shape
 
             self.schedule_compute_task(
                 compute_task=compute_task,
@@ -2034,6 +2776,20 @@ class CDCPPScheduler:
                 num_microbatches=num_microbatches,
             )
             self.deallocate_tensor_in_dicts()
+
+        if profile_this_iter:
+            self._profile_obj.disable()
+            if self._profile_iter_counter == self._profile_last - 1 and not self._profile_dumped:
+                self._profile_obj.dump_stats(self._profile_out)
+                self._profile_dumped = True
+                print(
+                    f"[CDC_PROFILE_DISPATCHER] rank{self.pp_rank} dumped cProfile "
+                    f"stats covering iters [{self._profile_warmup}, {self._profile_last}) "
+                    f"to {self._profile_out}",
+                    flush=True,
+                )
+        if self._profile_dispatcher and not forward_only:
+            self._profile_iter_counter += 1
 
         assert self.wgrad_store is None or self.wgrad_store.is_empty()
 
@@ -2272,6 +3028,114 @@ class CDCPPScheduler:
         dist.send(tensor, dst, group=group, tag=int(bandwidth_delay_to_inject))
         # dist.send(tensor, dst, group=group, tag=0)
 
+    def _maybe_calibrate_stock_inject_cycles(self) -> None:
+        """One-shot calibration of cycles-per-ms for the local SM clock.
+
+        Uses a 100ms `torch.cuda._sleep` and times it with CUDA events. The
+        hardcoded fallback (1,784,909 cycles/ms) is correct for H100 NVL —
+        this just makes the code portable to other GPUs.
+        """
+        if self._stock_inject_calibrated:
+            return
+        if not torch.cuda.is_available():
+            self._stock_inject_calibrated = True
+            return
+        try:
+            device = torch.cuda.current_device()
+            target_cycles = int(100 * self._stock_inject_cycles_per_ms)
+            torch.cuda.synchronize(device)
+            # Warmup.
+            torch.cuda._sleep(target_cycles)
+            torch.cuda.synchronize(device)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            torch.cuda._sleep(target_cycles)
+            end.record()
+            torch.cuda.synchronize(device)
+            measured_ms = start.elapsed_time(end)
+            if measured_ms > 0:
+                self._stock_inject_cycles_per_ms = float(target_cycles) / measured_ms
+        except Exception as exc:  # pragma: no cover - belt-and-suspenders
+            self.cdc_print(
+                f"stock latency calibration failed ({exc}); using fallback "
+                f"{self._stock_inject_cycles_per_ms} cycles/ms",
+                verbose=1,
+            )
+        finally:
+            self._stock_inject_calibrated = True
+            self.cdc_print(
+                f"stock latency injection: calibrated cycles/ms = "
+                f"{self._stock_inject_cycles_per_ms:.0f}",
+                verbose=1,
+            )
+
+    def _stock_inject_active_this_iter(self) -> bool:
+        """True iff stock-PyTorch latency injection should fire on this iter."""
+        if not self._stock_inject_enabled:
+            return False
+        cur_iter = getattr(self.args, "curr_iteration", 0)
+        return cur_iter >= self._stock_inject_warmup_iters
+
+    def _isend_with_optional_stock_spin(
+        self,
+        tensor: torch.Tensor,
+        dst: int,
+        group: dist.ProcessGroupNCCL | None,
+        direction: str,  # "next" or "prev"
+        bandwidth_delay_ms: int = 0,
+    ) -> dist.Work:
+        """Wrap `self.isend` so that, when stock-PyTorch latency injection is
+        enabled for this direction and we're past warmup, the actual NCCL send
+        kernel waits for a `torch.cuda._sleep` spin on a dedicated CUDA stream.
+
+        The spin runs concurrently with default-stream compute — only the
+        send kernel waits for it. Receiver naturally sees the data
+        `latency_ms` later.
+        """
+        if not self._stock_inject_active_this_iter():
+            return self.isend(
+                tensor, dst, group=group, bandwidth_delay_ms=bandwidth_delay_ms
+            )
+        delay_this_dir = (
+            (direction == "next" and self._stock_inject_delay_next)
+            or (direction == "prev" and self._stock_inject_delay_prev)
+        )
+        if not delay_this_dir:
+            return self.isend(
+                tensor, dst, group=group, bandwidth_delay_ms=bandwidth_delay_ms
+            )
+        self._maybe_calibrate_stock_inject_cycles()
+        device = torch.cuda.current_device()
+        if direction == "next":
+            stream = self._stock_inject_send_next_stream
+            if stream is None:
+                stream = torch.cuda.Stream(device=device)
+                self._stock_inject_send_next_stream = stream
+        else:
+            stream = self._stock_inject_send_prev_stream
+            if stream is None:
+                stream = torch.cuda.Stream(device=device)
+                self._stock_inject_send_prev_stream = stream
+        cycles = int(self._stock_inject_lat_ms * self._stock_inject_cycles_per_ms)
+        # Cross-stream data hazard: `tensor` is being produced by a forward/
+        # backward kernel on the default stream. NCCL's backend records its
+        # event from the CURRENT stream — if we just enter spin_stream here,
+        # NCCL would only wait for the spin, not for the default-stream
+        # producer kernel. That's a use-before-write race and shows up as
+        # corrupted gradients on the first injection iter. Force the spin
+        # stream to wait for the default stream's pending work first, then
+        # the spin + isend chain inherits the correct happens-before.
+        default_stream = torch.cuda.default_stream(device)
+        stream.wait_stream(default_stream)
+        with torch.cuda.stream(stream):
+            if cycles > 0:
+                torch.cuda._sleep(cycles)
+            work = self.isend(
+                tensor, dst, group=group, bandwidth_delay_ms=bandwidth_delay_ms
+            )
+        return work
+
     def isend(
         self,
         tensor: torch.Tensor,
@@ -2350,6 +3214,108 @@ class CDCPPScheduler:
             print(
                 f"[CDC] Global[{my_rank}] TP[{tp_rank}] PP[{pp_rank}] DP[{dp_rank}]:    {msg}"
             )
+
+    def _run_affine_profile(self, model, config, adjusted_seq_length, micro_batch_size):
+        """One-shot affine profiling sweep. Called from forward_backward_func
+        between the canonical profile iter and the LP solve. Writes
+        per-rank ``affine_profile_rank{N}.json`` and (rank 0)
+        ``affine_profile_comm.json`` next to ``total.json`` so the LP loader
+        can pick them up.
+
+        Compute is profiled per non-first stage; first-stage compute keeps
+        the existing single-point scaling because synthetic dataloader
+        equivalents are out of scope here. Communication is profiled per
+        directed adjacent edge."""
+        args = self.args
+        N = args.global_batch_size // (
+            args.data_parallel_size if hasattr(args, "data_parallel_size") else 1
+        )
+
+        sizes = args.cdc_profile_affine_sizes
+        if sizes is None:
+            sizes = affine_profiler.default_size_grid(N)
+        else:
+            sizes = sorted(set(int(s) for s in sizes if 1 <= int(s) <= N))
+            if not sizes:
+                sizes = affine_profiler.default_size_grid(N)
+
+        warmup = int(getattr(args, "cdc_profile_affine_warmup_iters", 2))
+        measure = int(getattr(args, "cdc_profile_affine_measure_iters", 5))
+        dtype = config.pipeline_dtype
+
+        self.cdc_print(
+            f"[affine] starting sweep on rank {self.pp_rank}: sizes={sizes}, warmup={warmup}, measure={measure}",
+            rank=0,
+        )
+        t0 = time.perf_counter()
+
+        # --- Compute sweep (per chunk on this rank) --------------------------
+        is_first = parallel_state.is_pipeline_first_stage(ignore_virtual=True)
+        is_last = parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+        chunks = model if isinstance(model, list) else [model]
+        # Vocab size for synthetic-token construction on the first stage.
+        # Pull from config / args if available; default to a small valid value
+        # so the embedding lookup gets in-range indices.
+        vocab_size = getattr(config, "vocab_size", None) or getattr(args, "padded_vocab_size", None) \
+            or getattr(args, "vocab_size", 32000)
+        compute_payload = {"chunks": {}}
+        for chunk_idx, _chunk in enumerate(chunks):
+            cell = affine_profiler.profile_compute_affine(
+                chunks=chunks,
+                chunk_idx=chunk_idx,
+                is_first_stage=is_first,
+                is_last_stage=is_last,
+                seq_length=adjusted_seq_length,
+                hidden_size=config.hidden_size,
+                vocab_size=int(vocab_size),
+                dtype=dtype,
+                sizes=sizes,
+                warmup=warmup,
+                measure=measure,
+            )
+            if cell is not None:
+                compute_payload["chunks"][str(chunk_idx)] = cell
+
+        # --- Comm sweep (per directed adjacent edge) -------------------------
+        comm_payload = None
+        if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+            comm_payload = affine_profiler.profile_comm_affine(
+                scheduler=self,
+                seq_length=adjusted_seq_length,
+                hidden_size=config.hidden_size,
+                dtype=dtype,
+                sizes=sizes,
+                warmup=warmup,
+                measure=measure,
+            )
+
+        # --- Naive single-point reference for plotting comparison -----------
+        # The current LP path scales T_F/T_B/T_W at one mbs (=micro_batch_size,
+        # unless the profile iter saw a different f). We expose that line on
+        # the plot for direct comparison with the affine fit.
+        naive_refs: Dict[Tuple[int, str], Tuple[int, float]] = {}
+        comp_dict = self.exp_manager.cdc_compute_profile_dict
+        for (mb_id, chunk_id, task_type), payload in comp_dict.items():
+            if task_type not in ("F", "B"):
+                continue
+            t_measured = payload[0] if isinstance(payload, (list, tuple)) else payload
+            naive_refs.setdefault((int(chunk_id), task_type), (int(micro_batch_size), float(t_measured)))
+
+        # --- Persist + plot --------------------------------------------------
+        affine_profiler.write_results_and_plots(
+            profile_result_path=self.exp_manager.profile_result_path,
+            pp_rank=self.pp_rank,
+            pp_size=parallel_state.get_pipeline_model_parallel_world_size(),
+            compute=compute_payload if compute_payload["chunks"] else None,
+            comm=comm_payload,
+            naive_compute_refs=naive_refs,
+        )
+
+        dist.barrier()
+        self.cdc_print(
+            f"[affine] sweep done in {time.perf_counter()-t0:.1f}s on rank {self.pp_rank}",
+            rank=0,
+        )
 
     def pp_benchmark(self):
         """
