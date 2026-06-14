@@ -933,6 +933,37 @@ class CDCDynamicScheduleGenerator:
                 # fit) keeps the single-point fallback above.
                 if getattr(self.args, "cdc_profile_affine", False):
                     self._apply_affine_overlays(comp, compBias, comm, commLat, f_profiled=f_profiled)
+                    # The affine comm intercepts were measured at profile iter 2, before
+                    # stock latency injection begins (cdc_stock_inject_warmup_iters), so
+                    # the overlay above erases the injected latency from commLat. Re-apply
+                    # it as a floor on the injected edges so the MILP sees the same
+                    # boundary latency the runtime will experience.
+                    #
+                    # EXCEPT: --cdc_dynamic_mb_schedule_lat_ms decouples the latency the
+                    # SCHEDULE assumes from the latency the runtime injects. With a fixed
+                    # microbatch count (K) the injected cross-boundary latency is paid on a
+                    # fixed number of crossings — a near-constant offset the schedule cannot
+                    # reduce — yet feeding it into the MILP distorts the compute-balance
+                    # objective so the solver picks schedules that are intrinsically slower
+                    # at BASE compute and lose to ZBH1 (exp7 / inv7). A value of 0 schedules
+                    # compute-only, producing the robust bell schedule (large microbatches
+                    # in the pipeline middle, near the slow link) that overlaps the latency
+                    # naturally and beats ZBH1 at every injected latency.
+                    #   sched_lat_ms <  0 : floor with the real injected latency (legacy)
+                    #   sched_lat_ms >= 0 : floor with this assumed latency (0 = compute-only)
+                    sched_lat_ms = float(
+                        getattr(self.args, "cdc_dynamic_mb_schedule_lat_ms", -1.0)
+                    )
+                    for _src in range(self.pp_size):
+                        for _dst in range(self.pp_size):
+                            if self.injected_latency[_src][_dst] > 0:
+                                if sched_lat_ms < 0:
+                                    floor = float(T_alpha_with_inject[_src][_dst])
+                                else:
+                                    floor = sched_lat_ms / 1000.0
+                                commLat[_src][_dst] = max(
+                                    commLat[_src][_dst], floor
+                                )
 
                 # Floor very-small intercepts so the integer scaling below
                 # doesn't blow up. Anything < 2% of slope*max_in_grid is
@@ -1056,7 +1087,9 @@ class CDCDynamicScheduleGenerator:
                         g.prob.objective += shape_penalty_us * pulp.lpSum(
                             y_s[s] for s in shapes_range
                         )
-                    g.solve_ilp(verbose=True, time_limit=600, relative_gap=0.01)
+                    # 300s: exp6 offline re-solves showed the 600s incumbent is
+                    # already found by 300s (bound stalls, incumbent stable).
+                    g.solve_ilp(verbose=True, time_limit=300, relative_gap=0.01)
 
                     mb_sizes = g.get_microbatch_sizes()
                     schedule_blocks = g.get_schedule()
@@ -1142,9 +1175,8 @@ class CDCDynamicScheduleGenerator:
                                 else "n/a"
                             )
                             print(
-                                f"[dynamic_mb][safety] keeping MILP-chosen schedule "
-                                f"(chosen={chosen_obj/scale*1e3:.2f}ms vs "
-                                f"uniform={uniform_ms})"
+                                f"[dynamic_mb][diag] LP predicts chosen={chosen_obj/scale*1e3:.2f}ms "
+                                f"vs uniform={uniform_ms} (safety net disabled; MILP schedule used)"
                             )
 
                 print(f"[dynamic_mb] Solved microbatch sizes: {mb_sizes} (sum={sum(mb_sizes)})", flush=True)
