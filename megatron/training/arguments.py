@@ -1532,14 +1532,14 @@ def _add_distributed_args(parser):
 
     # dynamic_mb LP regularisation: shape penalty (us per distinct microbatch shape)
     # and an overridable upper bound on the per-microbatch size. Default
-    # max_f_cap = 0 means "uniform_size + 2" (the v11 default). Set to N to
-    # remove the cap entirely (LP can pick any f_i in [1, N]).
+    # max_f_cap = 0 means "uniform_size + 2". Set to N to remove the cap entirely
+    # (LP can pick any f_i in [1, N]).
     group.add_argument('--cdc_dynamic_mb_shape_penalty_us', type=float, default=500.0,
                        help='Per-distinct-microbatch-shape penalty added to the dynamic_mb MILP objective, in microseconds. Regularises against the LP cost model\'s blind spot for per-shape runtime overhead (cuBLAS kernel selection, NCCL stream multiplexing, Python dispatcher). 0 disables.')
     group.add_argument('--cdc_dynamic_mb_max_f_cap', type=int, default=0,
                        help='Override the per-microbatch upper bound used by the dynamic_mb MILP. 0 (default) uses uniform_size + 2. Set to N (global batch) to disable the cap and let the LP pick any size in [1, N]; useful for investigating how much the cap restricts the search vs the penalty.')
     group.add_argument('--cdc_dynamic_mb_schedule_lat_ms', type=float, default=-1.0,
-                       help='Latency (ms) the dynamic_mb MILP assumes on the injected cross-boundary link when CHOOSING microbatch sizes, decoupled from the latency the runtime actually injects (--cdc_stock_inject_latency_ms). <0 (default) uses the real injected latency (legacy behaviour). 0 schedules compute-only: with a fixed microbatch count the injected latency is a near-constant offset the schedule cannot reduce, and feeding it into the MILP distorts the compute-balance objective into schedules that are intrinsically slower at base compute (exp7). Setting 0 yields the robust compute-balanced schedule that beats ZBH1 at every injected latency.')
+                       help='Latency (ms) the dynamic_mb MILP assumes on the injected cross-boundary link when choosing microbatch sizes, decoupled from the latency the runtime actually injects (--cdc_stock_inject_latency_ms). <0 (default) uses the real injected latency. 0 schedules compute-only: with a fixed microbatch count the injected latency is a near-constant offset the schedule cannot reduce, so feeding it into the MILP biases the compute-balance objective. See docs/heteropipe_design.md for details.')
 
     group.add_argument('--cdc_exp_logging', action='store_true', default=False, help='CDC experiment logging')
     group.add_argument('--cdc_exp_tf_block_size', type=int, default=0, help='Only for logging: CDC experiment transformer block size')    
@@ -1557,7 +1557,7 @@ def _add_distributed_args(parser):
 
     # Stock-PyTorch (no custom build) artificial latency injection. Uses
     # torch.cuda._sleep on a dedicated send-side stream to delay isend without
-    # blocking default-stream compute. See tmp_sganter/docs/comm_delay_investigation.md.
+    # blocking default-stream compute. See docs/heteropipe_design.md.
     group.add_argument('--cdc_stock_inject_latency_ms', type=float, default=0.0,
                        help='Per-link artificial latency in ms (stock PyTorch, '
                             'sender-side torch.cuda._sleep). 0 disables.')

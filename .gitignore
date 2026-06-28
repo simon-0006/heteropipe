@@ -1,4 +1,6 @@
 __pycache__
+*.pyc
+.pytest_cache/
 *.so
 build
 .coverage_*
@@ -10,3 +12,22 @@ logs
 local/
 .gitmodules
 .triton_cache
+
+# OS / editor cruft
+.DS_Store
+
+# Profiling and run artifacts
+tb_logs*/
+*.log
+*.nsys-rep
+*.sqlite
+*.prof
+
+# Generated schedule / profile outputs
+dynamic_mb.json
+affine_profile*.json
+affine_plots/
+exec_plan*.log
+override_cfg_*.json
+exp_*.json
+exp_final.json

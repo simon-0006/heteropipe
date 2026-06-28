@@ -172,8 +172,8 @@ class DynamicMicrobatchIterator:
     underlying iterator yields ``None`` — we just pass those through.
 
     Chunks are kept at their true variable sizes — no padding. The
-    JIT-recv fix in ``schedule_comm_event`` makes that safe at pp >= 4
-    (see tmp_sganter/8_4gpu_hang_root_cause.md Update 16).
+    just-in-time receive in ``schedule_comm_event`` makes that safe at
+    pp >= 4.
     """
 
     def __init__(self, base_iterator, microbatch_sizes: List[int], equal_mb_size: int):
@@ -296,7 +296,7 @@ class DynamicMicrobatchIterator:
 
     def _refill_legacy(self):
         """Original concat-then-split refill, kept behind CDC_DISABLE_OPT1=1
-        so the new path can be A/B-tested for correctness."""
+        as a correctness reference for the streaming refill path."""
         N = sum(self.microbatch_sizes)
         num_equal_batches = N // self.equal_mb_size
         batches = []
@@ -410,15 +410,14 @@ class DynamicMicrobatchIterator:
 def get_or_set_pp_io_tensor(tensor_dict: Dict, key, config, tensor_shape):
     """Return cached buffer for key, allocating only on miss.
 
-    Optimization 2 (see tmp_sganter/docs/dispatcher_optimizations.md):
-    dict.setdefault always evaluates its default expression, so the
-    previous implementation allocated a throwaway torch.empty on every
-    call even when the cache already had the entry. Switch to an
-    explicit miss-check so the allocation only happens when needed.
+    dict.setdefault always evaluates its default expression, so a naive
+    implementation would allocate a throwaway torch.empty on every call
+    even when the cache already had the entry. We use an explicit
+    miss-check so the allocation only happens when needed.
 
-    Note: pp_scheduler clears entries to None after use (see input_tensors
-    cleanup around line 1855). For a None-valued entry, we treat it as a
-    miss and re-allocate, matching the original semantics.
+    Note: pp_scheduler clears entries to None after use during input
+    tensor cleanup. For a None-valued entry, we treat it as a miss and
+    re-allocate, matching the original semantics.
     """
     val = tensor_dict.get(key)
     if val is None:
@@ -943,13 +942,12 @@ class CDCDynamicScheduleGenerator:
                     # SCHEDULE assumes from the latency the runtime injects. With a fixed
                     # microbatch count (K) the injected cross-boundary latency is paid on a
                     # fixed number of crossings — a near-constant offset the schedule cannot
-                    # reduce — yet feeding it into the MILP distorts the compute-balance
-                    # objective so the solver picks schedules that are intrinsically slower
-                    # at BASE compute and lose to ZBH1 (exp7 / inv7). A value of 0 schedules
-                    # compute-only, producing the robust bell schedule (large microbatches
-                    # in the pipeline middle, near the slow link) that overlaps the latency
-                    # naturally and beats ZBH1 at every injected latency.
-                    #   sched_lat_ms <  0 : floor with the real injected latency (legacy)
+                    # reduce — yet feeding it into the MILP biases the compute-balance
+                    # objective toward schedules that are slower at base compute. A value of
+                    # 0 schedules compute-only, producing the bell schedule (large
+                    # microbatches in the pipeline middle, near the slow link) that overlaps
+                    # the latency naturally. See docs/heteropipe_design.md.
+                    #   sched_lat_ms <  0 : floor with the real injected latency
                     #   sched_lat_ms >= 0 : floor with this assumed latency (0 = compute-only)
                     sched_lat_ms = float(
                         getattr(self.args, "cdc_dynamic_mb_schedule_lat_ms", -1.0)
@@ -968,7 +966,7 @@ class CDCDynamicScheduleGenerator:
                 # Floor very-small intercepts so the integer scaling below
                 # doesn't blow up. Anything < 2% of slope*max_in_grid is
                 # numerical noise from the regression on a near-perfectly-
-                # linear cell — see issue (i) in the design doc.
+                # linear cell.
                 _floor_small_intercepts(compBias, comp, N)
 
                 # Integer scaling for the MILP. We use a fixed scale (sec ->
@@ -1087,8 +1085,9 @@ class CDCDynamicScheduleGenerator:
                         g.prob.objective += shape_penalty_us * pulp.lpSum(
                             y_s[s] for s in shapes_range
                         )
-                    # 300s: exp6 offline re-solves showed the 600s incumbent is
-                    # already found by 300s (bound stalls, incumbent stable).
+                    # 300s time limit: in practice the incumbent found by 300s
+                    # matches the 600s one (the bound stalls while the incumbent
+                    # stays stable), so the extra budget rarely changes the result.
                     g.solve_ilp(verbose=True, time_limit=300, relative_gap=0.01)
 
                     mb_sizes = g.get_microbatch_sizes()
@@ -1207,7 +1206,7 @@ class CDCDynamicScheduleGenerator:
                 saved = json.load(f)
             schedule_dicts = saved["schedule"]
             self.microbatch_sizes = saved["microbatch_sizes"]
-            # Win 2: keep dyn_loss_scale cache consistent with microbatch_sizes.
+            # Keep the dyn_loss_scale cache consistent with microbatch_sizes.
             if self.microbatch_sizes is not None:
                 _N = sum(self.microbatch_sizes)
                 self._dyn_loss_scales = [s / _N for s in self.microbatch_sizes]
@@ -1692,28 +1691,27 @@ class CDCPPScheduler:
 
         # dynamic microbatch sizes (None = all equal, set after solver runs)
         self.microbatch_sizes: Optional[List[int]] = None
-        # Win 2 cache (recomputed when microbatch_sizes is assigned).
+        # Per-microbatch loss-scale cache (recomputed when microbatch_sizes is assigned).
         self._dyn_loss_scales: Optional[List[float]] = None
-        # Win 4 cache (per-mb tensor_shape; recomputed once per call to
+        # Per-microbatch tensor_shape cache (recomputed once per call to
         # forward_backward_func when microbatch_sizes is set).
         self._cached_tensor_shapes: Optional[List[List[int]]] = None
-        # Win 3: cached "data iterator was wrapped this iter" flag, set in
-        # forward_backward_func once per iter so per-task hot loop doesn't
+        # Cached "data iterator was wrapped this iter" flag, set in
+        # forward_backward_func once per iter so the per-task hot loop doesn't
         # need a per-task isinstance() check.
         self._data_iter_is_dynamic: bool = False
 
-        # NOTE: heteropipe used to create dedicated 2-rank P2P ProcessGroups
-        # here when use_dynamic_schedule and pp_size > 2, as a workaround for
-        # the 4-GPU dangling-recv NCCL hang (see tmp_sganter/docs/root_cause.md).
-        # That workaround was removed once JIT-recv fixed the actual root cause:
-        # dynamic_mb now uses the same `parallel_state.get_pipeline_extra_*_group()`
-        # NCCL communicators as the static (ZBH1, 1F1B, ...) schedules.
+        # NOTE: an earlier version created dedicated 2-rank P2P ProcessGroups
+        # here when use_dynamic_schedule and pp_size > 2, as a workaround for a
+        # 4-GPU dangling-recv NCCL hang. That workaround was removed once the
+        # just-in-time receive (see schedule_comm_event) addressed the root
+        # cause: dynamic_mb now uses the same
+        # `parallel_state.get_pipeline_extra_*_group()` NCCL communicators as
+        # the static (ZBH1, 1F1B, ...) schedules.
 
-        # Optimization 1 (see tmp_sganter/docs/dispatcher_optimizations.md):
-        # cache parallel_state lookups that are constant after init.
-        # schedule_comm_event used to call these on every event (~300 events/iter
-        # = ~1800 cross-module function calls per iteration that all return
-        # constants). Now they're computed once.
+        # Cache parallel_state lookups that are constant after init.
+        # schedule_comm_event would otherwise call these on every event
+        # (hundreds of events/iter, all returning constants); compute once.
         self._cached_next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
         self._cached_prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
         self._cached_extra_send_next_group = parallel_state.get_pipeline_extra_send_next_group()
@@ -1722,7 +1720,7 @@ class CDCPPScheduler:
         self._cached_extra_recv_prev_group = parallel_state.get_pipeline_extra_recv_prev_group()
 
         # Stock-PyTorch artificial latency injection (sender-side `torch.cuda._sleep`).
-        # See tmp_sganter/docs/comm_delay_investigation.md for rationale.
+        # See docs/heteropipe_design.md for rationale.
         # Why sender-side: putting the spin on the receiver's WAIT path adds
         # latency_ms on TOP of any prior compute, which overcounts and kills
         # the overlap the MILP modeled. On the sender's send stream, the spin
@@ -1917,10 +1915,9 @@ class CDCPPScheduler:
                 self.injected_latency_delay[1], self.injected_bandwidth_delay[1]
             )
             # Plumb the stock-PyTorch artificial latency into the LP cost
-            # model. Without this the MILP profiles at iter 2 (fast NVLink),
-            # picks a schedule with many small microbatches that don't
-            # amortize the per-send latency, and loses to ZBH1 at runtime.
-            # See tmp_sganter/logs/injected_latency/RESULTS_pp4.md.
+            # model. Without this the MILP profiles on the fast intra-node link,
+            # picks a schedule with many small microbatches that don't amortize
+            # the per-send latency, and underperforms at runtime.
             if self._stock_inject_enabled:
                 self.pp_schedule_generator.apply_stock_inject_latency(
                     latency_seconds=self._stock_inject_lat_ms / 1000.0,
@@ -1936,7 +1933,7 @@ class CDCPPScheduler:
             # Propagate dynamic microbatch sizes if available
             if self.pp_schedule_generator.microbatch_sizes is not None:
                 self.microbatch_sizes = self.pp_schedule_generator.microbatch_sizes
-                # Win 2: cache dyn_loss_scale array (one division per mb instead
+                # Cache the dyn_loss_scale array (one division per mb instead
                 # of recomputing sum(microbatch_sizes) / per-mb division each task).
                 _N = sum(self.microbatch_sizes)
                 self._dyn_loss_scales = [s / _N for s in self.microbatch_sizes]
@@ -1973,13 +1970,13 @@ class CDCPPScheduler:
 
         dist.barrier()
 
-        # Note: heteropipe used to do a parity-based 4-phase eager P2P warmup
+        # Note: an earlier version did a parity-based 4-phase eager P2P warmup
         # here to force NCCL to materialize the dedicated 2-rank communicators
         # before the first real iteration. With the dedicated groups removed
-        # (JIT-recv made them unnecessary, see tmp_sganter/docs/root_cause.md),
-        # the schedule reuses the same `parallel_state.get_pipeline_extra_*_group()`
-        # NCCL communicators that ZBH1/1F1B already use, which are initialized
-        # by Megatron's own setup. No additional warmup needed.
+        # (the just-in-time receive made them unnecessary), the schedule reuses
+        # the same `parallel_state.get_pipeline_extra_*_group()` NCCL
+        # communicators that ZBH1/1F1B already use, which are initialized by
+        # Megatron's own setup. No additional warmup needed.
 
         self.exp_manager.exp_logging_perf_model_iter_time[(self.injected_latency_delay, self.injected_bandwidth_delay)] = estimated_runtime
 
@@ -2118,27 +2115,25 @@ class CDCPPScheduler:
             )
 
     def schedule_comm_event(self, event: CommEvent, config, tensor_shape, forward_only=False):
-        # Optimization 1: read cached values instead of calling parallel_state
-        # lookups every event. These are constant for the lifetime of this
-        # scheduler. See tmp_sganter/docs/dispatcher_optimizations.md.
+        # Read cached values instead of calling parallel_state lookups every
+        # event. These are constant for the lifetime of this scheduler.
         next_rank = self._cached_next_rank
         prev_rank = self._cached_prev_rank
 
         # With dynamic microbatch sizes, the P2P shape is the per-mb size.
-        # The 4-GPU dangling-recv NCCL deadlock with heterogeneous P2P shapes
-        # (see tmp_sganter/8_4gpu_hang_root_cause.md Update 15) is fixed by
-        # the JIT-recv path below: irecv is deferred to WAIT time so no recv
-        # kernel sits dangling on a NCCL stream during cuBLAS first-init's
-        # device-wide sync.
-        # Win 4: per-event tensor_shape override now reads from a per-mb
-        # precomputed list (built once per call to forward_backward_func)
-        # instead of allocating a new list on every event.
+        # A 4-GPU dangling-recv NCCL deadlock with heterogeneous P2P shapes is
+        # avoided by the just-in-time receive below: irecv is deferred to WAIT
+        # time so no recv kernel sits dangling on a NCCL stream during cuBLAS
+        # first-init's device-wide sync.
+        # The per-event tensor_shape override reads from a per-mb precomputed
+        # list (built once per call to forward_backward_func) instead of
+        # allocating a new list on every event.
         if self._cached_tensor_shapes is not None and not forward_only:
             tensor_shape = self._cached_tensor_shapes[event.mb_id]
 
-        # Optimization 1: cached at init time. Same NCCL groups for static and
-        # dynamic schedules (the heteropipe dedicated 2-rank P2P groups were
-        # removed once JIT-recv made them unnecessary).
+        # Cached at init time. Same NCCL groups for static and dynamic
+        # schedules (the dedicated 2-rank P2P groups were removed once the
+        # just-in-time receive made them unnecessary).
         send_next_group = self._cached_extra_send_next_group
         recv_next_group = self._cached_extra_recv_next_group
         send_prev_group = self._cached_extra_send_prev_group
@@ -2195,7 +2190,7 @@ class CDCPPScheduler:
         elif event.type == CommEventType.POST_RECV_NEXT:
             # Defer the irecv until WAIT_RECV_NEXT to avoid dangling recv kernels
             # on the NCCL stream (which deadlock cuBLAS first-init device-wide
-            # sync — see tmp_sganter/8_4gpu_hang_root_cause.md Update 15).
+            # sync).
             _buf = recv_buffer
             _grp = recv_next_group
             _peer = next_rank
@@ -2349,7 +2344,7 @@ class CDCPPScheduler:
             
             with nvtx.range(f"Dev{self.pp_rank} F: {mb_id} chunk: {chunk_id}"):
                 if not self.subblock_scheduling:
-                    # Win 2: read precomputed loss_scale instead of recomputing
+                    # Read the precomputed loss_scale instead of recomputing
                     # sum(microbatch_sizes) / per-mb division each task.
                     dyn_loss_scale = (
                         self._dyn_loss_scales[mb_id]
@@ -2357,7 +2352,7 @@ class CDCPPScheduler:
                         else None
                     )
 
-                    # Win 3: cached boolean instead of per-task isinstance().
+                    # Cached boolean instead of a per-task isinstance().
                     if self._data_iter_is_dynamic:
                         data_iterator[chunk_id].set_next_mb_id(mb_id)
 
@@ -2746,8 +2741,8 @@ class CDCPPScheduler:
 
         # Wrap data iterators for dynamic microbatch sizes (must happen after
         # update_schedule_with_latency_bandwidth which may set self.microbatch_sizes).
-        # Win 3: store boolean flag once so per-task hot loop can skip a per-task
-        # isinstance() check.
+        # Store the boolean flag once so the per-task hot loop can skip a
+        # per-task isinstance() check.
         is_dynamic = self.microbatch_sizes is not None and not forward_only
         # Profiling escape hatch: when CDC_BYPASS_DYNAMIC_ITERATOR=1, pretend
         # the schedule is static. Only correct when every entry of
@@ -2760,9 +2755,9 @@ class CDCPPScheduler:
                 DynamicMicrobatchIterator(di, self.microbatch_sizes, micro_batch_size)
                 for di in data_iterator
             ]
-            # Win 4: build the per-mb tensor_shape cache once per iter.
-            # schedule_comm_event will read directly from this list per event,
-            # avoiding ~300 list() allocations + per-event index lookups.
+            # Build the per-mb tensor_shape cache once per iter.
+            # schedule_comm_event reads directly from this list per event,
+            # avoiding a list() allocation and index lookup per event.
             self._cached_tensor_shapes = [
                 [adjusted_seq_length, s, config.hidden_size]
                 for s in self.microbatch_sizes
@@ -3362,8 +3357,7 @@ class CDCPPScheduler:
         next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
-        # DEBUG/E1: bypass even-pp assertion so we can test pp=3
-        # assert pp_size % 2 == 0
+        # This point-to-point benchmark does not require an even pipeline size.
 
         warmup = 2
         num_iters = 10

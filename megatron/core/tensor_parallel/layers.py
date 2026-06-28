@@ -1196,8 +1196,13 @@ class RowParallelLinear(torch.nn.Module):
             from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
             scheduler = get_cdc_pp_scheduler()
             if scheduler.wgrad_split:
-                # DEBUG/E2: bypass sequence_parallel assertion to allow testing
-                # --transformer-impl local with TP=1. May misbehave for real runs.
+                # The weight-gradient split reduce-scatters the RowParallelLinear
+                # output inside the core function only under sequence parallelism.
+                # With TP=1 the split runs without sequence parallelism and this
+                # path stays disabled. This configuration (TP=1, no sequence
+                # parallel) is the one validated for the dynamic_mb experiments;
+                # weight-gradient split with TP>1 and sequence parallelism off is
+                # not supported.
                 if args.sequence_parallel:
                     self.reduce_scatter_output_in_RPL_core_func = True
             

@@ -7,7 +7,8 @@ multiple microbatch sizes, fits an affine model
     t(mbs) = slope * mbs + intercept
 
 and writes the fits + measurement scatter + visualization plots under
-``{profile_result_path}/affine_profile.json`` and ``./affine_plots/``.
+``{profile_result_path}/affine_profile.json`` and
+``{profile_result_path}/affine_plots/``.
 
 Activated by ``--cdc_profile_affine``. Coexists with the existing
 single-point timing path that feeds the dynamic_mb LP today; the LP
@@ -250,7 +251,7 @@ def profile_comm_affine(
 
 
 # ---------------------------------------------------------------------------
-# Compute profiling (non-first stage only in V1)
+# Compute profiling
 # ---------------------------------------------------------------------------
 
 
@@ -495,7 +496,7 @@ def plot_affine_fit(
 
 def _provenance_meta() -> Dict:
     """Reproducibility footprint for the affine profile run. Saved alongside
-    the fit data so future-you on a different cluster can tell whether the
+    the fit data so a later run on a different cluster can tell whether the
     cached numbers are still relevant."""
     meta = {"timestamp": time.time()}
     try:
